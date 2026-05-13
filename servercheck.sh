@@ -4,7 +4,7 @@
 #  Rawon Hunter™ | github.com/bssn1337/domain-recon
 # ============================================================
 
-VERSION="2.1.0"
+VERSION="2.1.1"
 
 R='\033[0;31m' G='\033[0;32m' Y='\033[0;33m'
 C='\033[0;36m' W='\033[1;37m' DIM='\033[2m' NC='\033[0m'
@@ -115,10 +115,21 @@ module_apache_roots() {
 # MODULE: Nginx
 # ============================================================
 module_nginx() {
+  # Prioritas: nginx -T (dump semua config termasuk custom include path)
+  if nginx -T &>/dev/null; then
+    while IFS= read -r domain; do
+      DOMAINS+=("$domain")
+    done < <(nginx -T 2>/dev/null \
+      | grep -v '^\s*#' | grep 'server_name' | grep -v 'if\s*(' \
+      | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
+      | grep -Ev 'example|localhost|invalid|\.local$')
+    return
+  fi
+
+  # Fallback: scan dir standar
   local DIRS=()
   [ -d /etc/nginx/sites-enabled ] && DIRS+=("/etc/nginx/sites-enabled")
   [ -d /etc/nginx/conf.d ]        && DIRS+=("/etc/nginx/conf.d")
-
   for DIR in "${DIRS[@]}"; do
     while IFS= read -r domain; do
       DOMAINS+=("$domain")
@@ -130,10 +141,21 @@ module_nginx() {
 }
 
 module_nginx_roots() {
+  # Prioritas: nginx -T
+  if nginx -T &>/dev/null; then
+    nginx -T 2>/dev/null | grep -v '^\s*#' | grep -v 'if\s*(' | \
+    awk '
+      /server_name/ { match($0,/[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}/); dom=substr($0,RSTART,RLENGTH) }
+      /^\s*root\s/  { gsub(/[;]/,"",$2); if(dom){ printf "  \033[0;36m→\033[0m %-40s \033[2m%s\033[0m\n",dom,$2; dom="" } }
+      /proxy_pass/  { gsub(/[;]/,"",$2); if(dom){ printf "  \033[0;36m→\033[0m %-40s \033[2m→ proxy: %s\033[0m\n",dom,$2; dom="" } }
+    '
+    return
+  fi
+
+  # Fallback: scan dir standar
   local DIRS=()
   [ -d /etc/nginx/sites-enabled ] && DIRS+=("/etc/nginx/sites-enabled")
   [ -d /etc/nginx/conf.d ]        && DIRS+=("/etc/nginx/conf.d")
-
   for DIR in "${DIRS[@]}"; do
     grep -rh 'server_name\|^\s*root\s\|proxy_pass' "$DIR" 2>/dev/null \
       | grep -v '^\s*#' | grep -v 'if\s*(' | \
