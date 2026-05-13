@@ -35,49 +35,7 @@ echo -e "  ${INFO} Public IP  : ${W}${MYIP}${NC}"
 echo -e "  ${INFO} Local IP   : ${LOCALIP}"
 
 # ============================================================
-# 2. RESOURCES
-# ============================================================
-header "RESOURCES"
-
-# CPU
-CPU_CORES=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo)
-LOAD=$(cat /proc/loadavg | awk '{print $1, $2, $3}')
-LOAD1=$(echo $LOAD | awk '{print $1}')
-CPU_MODEL=$(grep 'model name' /proc/cpuinfo 2>/dev/null | head -1 | cut -d: -f2 | sed 's/^ //')
-echo -e "  ${INFO} CPU        : ${CPU_MODEL:-Unknown} (${CPU_CORES} cores)"
-echo -e "  ${INFO} Load Avg   : ${W}${LOAD}${NC}"
-
-LOAD_WARN=$(echo "$LOAD1 $CPU_CORES" | awk '{if($1>$2*0.8) print "HIGH"; else print "OK"}')
-[ "$LOAD_WARN" = "HIGH" ] && echo -e "  ${WARN} Load tinggi — lebih dari 80% kapasitas CPU"
-
-# RAM
-RAM_TOTAL=$(free -m | awk '/^Mem:/{print $2}')
-RAM_USED=$(free -m  | awk '/^Mem:/{print $3}')
-RAM_FREE=$(free -m  | awk '/^Mem:/{print $7}')
-RAM_PCT=$(awk "BEGIN{printf \"%.0f\", ($RAM_USED/$RAM_TOTAL)*100}")
-SWAP_TOTAL=$(free -m | awk '/^Swap:/{print $2}')
-SWAP_USED=$(free -m  | awk '/^Swap:/{print $3}')
-
-RAM_COLOR=$G; [ "$RAM_PCT" -gt 80 ] && RAM_COLOR=$Y; [ "$RAM_PCT" -gt 95 ] && RAM_COLOR=$R
-echo -e "  ${INFO} RAM        : ${RAM_COLOR}${RAM_USED}MB / ${RAM_TOTAL}MB (${RAM_PCT}%)${NC} — available: ${RAM_FREE}MB"
-if [ "$SWAP_TOTAL" -gt 0 ]; then
-  SWAP_PCT=$(awk "BEGIN{printf \"%.0f\", ($SWAP_USED/$SWAP_TOTAL)*100}")
-  echo -e "  ${INFO} Swap       : ${SWAP_USED}MB / ${SWAP_TOTAL}MB (${SWAP_PCT}%)"
-else
-  echo -e "  ${WARN} Swap       : tidak ada swap"
-fi
-
-# Disk
-echo
-echo -e "  ${INFO} Disk Usage :"
-df -h --output=target,size,used,avail,pcent 2>/dev/null | grep -v tmpfs | grep -v udev | grep -v Filesystem | while read MNT SZ USED AVAIL PCT; do
-  PCTNUM=${PCT/\%/}
-  COLOR=$G; [ "$PCTNUM" -gt 80 ] && COLOR=$Y; [ "$PCTNUM" -gt 95 ] && COLOR=$R
-  printf "    %-20s ${COLOR}%s${NC} used / %s total (%s avail)\n" "$MNT" "$USED" "$SZ" "$AVAIL"
-done
-
-# ============================================================
-# 3. DOMAIN DETECTION
+# 2. DOMAIN DETECTION
 # ============================================================
 header "DOMAIN DETECTION"
 
@@ -307,10 +265,60 @@ ss -tlnp 2>/dev/null | grep LISTEN | awk '{print $4}' | grep -oE '[0-9]+$' | sor
 echo
 
 # ============================================================
-# 9. TOP PROCESSES
+# 9. WEB ROOT LOCATIONS
 # ============================================================
-header "TOP PROCESSES (CPU)"
-ps aux --sort=-%cpu 2>/dev/null | awk 'NR<=8{printf "  %-8s %-6s %-6s %s\n", $1, $3"%", $4"%", $11}' | head -8
+header "WEB ROOT LOCATIONS"
+
+# Apache / httpd
+for DIR in /etc/apache2/sites-enabled /etc/httpd/conf/sites-enabled /etc/httpd/conf.d; do
+  [ -d "$DIR" ] || continue
+  grep -rh 'ServerName\|DocumentRoot' "$DIR" 2>/dev/null | grep -v '^\s*#' | while read -r line; do
+    if echo "$line" | grep -qi 'ServerName'; then
+      CURRENT_DOMAIN=$(echo "$line" | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' | head -1)
+    elif echo "$line" | grep -qi 'DocumentRoot'; then
+      DOCROOT=$(echo "$line" | awk '{print $2}' | tr -d '"')
+      [ -n "$CURRENT_DOMAIN" ] && [ -n "$DOCROOT" ] && \
+        printf "  ${INFO} %-40s ${DIM}%s${NC}\n" "$CURRENT_DOMAIN" "$DOCROOT"
+    fi
+  done
+done
+
+# Nginx
+for DIR in /etc/nginx/sites-enabled /etc/nginx/conf.d; do
+  [ -d "$DIR" ] || continue
+  for CONF in "$DIR"/*.conf "$DIR"/*; do
+    [ -f "$CONF" ] || continue
+    CURRENT_DOMAIN=""
+    while IFS= read -r line; do
+      if echo "$line" | grep -q 'server_name' && ! echo "$line" | grep -q 'if\s*('; then
+        CURRENT_DOMAIN=$(echo "$line" | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' | head -1)
+      elif echo "$line" | grep -q '^\s*root\s'; then
+        DOCROOT=$(echo "$line" | awk '{print $2}' | tr -d ';')
+        [ -n "$CURRENT_DOMAIN" ] && [ -n "$DOCROOT" ] && \
+          printf "  ${INFO} %-40s ${DIM}%s${NC}\n" "$CURRENT_DOMAIN" "$DOCROOT"
+      elif echo "$line" | grep -q 'proxy_pass'; then
+        PROXY=$(echo "$line" | awk '{print $2}' | tr -d ';')
+        [ -n "$CURRENT_DOMAIN" ] && [ -n "$PROXY" ] && \
+          printf "  ${INFO} %-40s ${DIM}→ proxy: %s${NC}\n" "$CURRENT_DOMAIN" "$PROXY"
+        CURRENT_DOMAIN=""
+      fi
+    done < "$CONF"
+  done
+done
+
+# Docker containers web roots
+if command -v docker &>/dev/null; then
+  for CID in $(docker ps -q 2>/dev/null); do
+    CNAME=$(docker inspect --format '{{.Name}}' "$CID" | tr -d '/')
+    DOMAIN=$(docker exec "$CID" bash -c \
+      "grep -rh 'ServerName\|server_name' /etc/apache2/sites-enabled/ /etc/nginx/ 2>/dev/null \
+       | grep -v '#' | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' | head -1" 2>/dev/null)
+    DOCROOT=$(docker exec "$CID" bash -c \
+      "grep -rh 'DocumentRoot\|^\s*root\s' /etc/apache2/sites-enabled/ /etc/nginx/ 2>/dev/null \
+       | grep -v '#' | awk '{print \$2}' | tr -d ';\042' | head -1" 2>/dev/null)
+    [ -n "$DOMAIN" ] && printf "  ${INFO} %-40s ${DIM}[docker: %s] %s${NC}\n" "$DOMAIN" "$CNAME" "${DOCROOT:-N/A}"
+  done
+fi
 
 # ============================================================
 # SUMMARY
@@ -318,7 +326,5 @@ ps aux --sort=-%cpu 2>/dev/null | awk 'NR<=8{printf "  %-8s %-6s %-6s %s\n", $1,
 header "SUMMARY"
 echo -e "  ${INFO} Script    : servercheck.sh v${VERSION} by Rawon Hunter™"
 echo -e "  ${INFO} Domains   : ${#DOMAINS[@]} terdeteksi"
-echo -e "  ${INFO} RAM       : ${RAM_PCT}% used"
 echo -e "  ${INFO} Disk      : $(df -h / | awk 'NR==2{print $5}') used on /"
-echo -e "  ${INFO} Load      : ${LOAD}"
 echo
