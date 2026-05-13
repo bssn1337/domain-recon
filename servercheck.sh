@@ -4,7 +4,7 @@
 #  Rawon Hunter™ | github.com/bssn1337/domain-recon
 # ============================================================
 
-VERSION="2.2.0"
+VERSION="2.3.0"
 
 R='\033[0;31m' G='\033[0;32m' Y='\033[0;33m'
 C='\033[0;36m' W='\033[1;37m' DIM='\033[2m' NC='\033[0m'
@@ -49,6 +49,17 @@ detect_engine() {
   elif [ -d /usr/local/plesk ] || command -v plesk &>/dev/null; then
     WEB_ENGINE="plesk"
     echo -e "  ${PASS} Terdeteksi: ${W}Plesk${NC}"
+
+  elif [ -d /home/runcloud ] || command -v runcloud &>/dev/null || \
+       [ -d /etc/nginx-rc ] || [ -d /etc/apache2-rc ]; then
+    WEB_ENGINE="runcloud"
+    echo -e "  ${PASS} Terdeteksi: ${W}RunCloud${NC}"
+    if systemctl is-active --quiet nginx-rc 2>/dev/null || pgrep -x nginx &>/dev/null; then
+      echo -e "  ${INFO} Web server  : Nginx RC"
+    elif systemctl is-active --quiet apache2-rc 2>/dev/null || \
+         systemctl is-active --quiet apache2 2>/dev/null || pgrep -x apache2 &>/dev/null; then
+      echo -e "  ${INFO} Web server  : Apache RC"
+    fi
 
   elif systemctl is-active --quiet caddy 2>/dev/null || \
        pgrep -x caddy &>/dev/null; then
@@ -316,6 +327,60 @@ module_caddy_roots() {
 }
 
 # ============================================================
+# MODULE: RunCloud
+# ============================================================
+module_runcloud() {
+  local _raw _d
+
+  # RunCloud simpan nginx config di /etc/nginx-rc/apps.d/ atau conf.d
+  for DIR in /etc/nginx-rc/apps.d /etc/nginx-rc/conf.d \
+             /etc/nginx/conf.d /etc/nginx/sites-enabled \
+             /etc/apache2-rc/sites-enabled /etc/apache2/sites-enabled; do
+    [ -d "$DIR" ] || continue
+    _raw=$(grep -Rh 'server_name\|ServerName' "$DIR" 2>/dev/null \
+      | grep -v '^\s*#' | grep -v 'if\s*(' \
+      | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
+      | grep -Ev 'example|localhost|invalid|\.local$')
+    [ -n "$_raw" ] && while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
+  done
+
+  # Fallback: cari server_name di seluruh config nginx-rc
+  if [ ${#DOMAINS[@]} -eq 0 ]; then
+    _raw=$(find /etc/nginx-rc /etc/nginx /etc/apache2-rc /etc/apache2 \
+           -name "*.conf" 2>/dev/null \
+      | xargs grep -h 'server_name\|ServerName' 2>/dev/null \
+      | grep -v '^\s*#' | grep -v 'if\s*(' \
+      | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
+      | grep -Ev 'example|localhost|invalid|\.local$')
+    [ -n "$_raw" ] && while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
+  fi
+}
+
+module_runcloud_roots() {
+  for DIR in /etc/nginx-rc/apps.d /etc/nginx-rc/conf.d \
+             /etc/nginx/conf.d /etc/nginx/sites-enabled; do
+    [ -d "$DIR" ] || continue
+    grep -Rh 'server_name\|^\s*root\s\|proxy_pass' "$DIR" 2>/dev/null \
+      | grep -v '^\s*#' | grep -v 'if\s*(' | \
+    awk '
+      /server_name/ { match($0,/[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}/); dom=substr($0,RSTART,RLENGTH) }
+      /^\s*root\s/  { gsub(/[;]/,"",$2); if(dom){ printf "  \033[0;36m→\033[0m %-40s \033[2m%s\033[0m\n",dom,$2; dom="" } }
+      /proxy_pass/  { gsub(/[;]/,"",$2); if(dom){ printf "  \033[0;36m→\033[0m %-40s \033[2m→ proxy: %s\033[0m\n",dom,$2; dom="" } }
+    '
+  done
+
+  # Apache RC roots
+  for DIR in /etc/apache2-rc/sites-enabled /etc/apache2/sites-enabled; do
+    [ -d "$DIR" ] || continue
+    grep -Rh 'ServerName\|DocumentRoot' "$DIR" 2>/dev/null | grep -v '^\s*#' | \
+    awk '
+      /[Ss]erver[Nn]ame/ { match($0,/[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}/); dom=substr($0,RSTART,RLENGTH) }
+      /[Dd]ocument[Rr]oot/ { gsub(/[";]/,"",$2); if(dom) printf "  \033[0;36m→\033[0m %-40s \033[2m%s\033[0m\n",dom,$2; dom="" }
+    '
+  done
+}
+
+# ============================================================
 # COLLECT DOMAINS berdasarkan engine
 # ============================================================
 collect_domains() {
@@ -329,6 +394,7 @@ collect_domains() {
     plesk)         module_plesk ;;
     openlitespeed) module_openlitespeed ;;
     caddy)         module_caddy ;;
+    runcloud)      module_runcloud ;;
     unknown)       module_nginx; module_apache ;; # fallback scan dua engine utama
   esac
   DOMAINS=($(printf '%s\n' "${DOMAINS[@]}" | sort -u))
@@ -349,6 +415,7 @@ show_webroots() {
     plesk)         module_plesk_roots ;;
     openlitespeed) module_openlitespeed_roots ;;
     caddy)         module_caddy_roots ;;
+    runcloud)      module_runcloud_roots ;;
     unknown)       module_nginx_roots; module_apache_roots ;;
   esac
 }
