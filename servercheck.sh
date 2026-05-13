@@ -4,7 +4,7 @@
 #  Rawon Hunter™ | github.com/bssn1337/domain-recon
 # ============================================================
 
-VERSION="2.1.3"
+VERSION="2.2.0"
 
 R='\033[0;31m' G='\033[0;32m' Y='\033[0;33m'
 C='\033[0;36m' W='\033[1;37m' DIM='\033[2m' NC='\033[0m'
@@ -49,6 +49,11 @@ detect_engine() {
   elif [ -d /usr/local/plesk ] || command -v plesk &>/dev/null; then
     WEB_ENGINE="plesk"
     echo -e "  ${PASS} Terdeteksi: ${W}Plesk${NC}"
+
+  elif systemctl is-active --quiet caddy 2>/dev/null || \
+       pgrep -x caddy &>/dev/null; then
+    WEB_ENGINE="caddy"
+    echo -e "  ${PASS} Terdeteksi: ${W}Caddy${NC}"
 
   elif systemctl is-active --quiet nginx 2>/dev/null || \
        pgrep -x nginx &>/dev/null; then
@@ -260,6 +265,57 @@ module_openlitespeed_roots() {
 }
 
 # ============================================================
+# MODULE: Caddy
+# ============================================================
+module_caddy() {
+  local _raw _d
+  # Kumpulkan semua Caddyfile (main + include .d/*.caddy)
+  local _files=""
+  [ -f /etc/caddy/Caddyfile ] && _files="/etc/caddy/Caddyfile"
+  for f in /etc/caddy/Caddyfile.d/*.caddy /etc/caddy/*.caddy; do
+    [ -f "$f" ] && _files="$_files $f"
+  done
+  [ -z "$_files" ] && return
+
+  # Domain di Caddy = baris yang dimulai dengan hostname (bukan directive)
+  # Format: "domain.com {" atau "domain1.com, domain2.com {"
+  _raw=$(grep -Eh '^[a-zA-Z0-9]' $_files 2>/dev/null \
+    | grep -v '^\s*#' \
+    | grep '\.' \
+    | grep -v 'import\|tls\|encode\|root\|file_server\|reverse_proxy\|handle\|log\|php' \
+    | sed 's/{.*//; s/,/ /g; s/https\?:\/\///g' \
+    | grep -oE '[a-zA-Z0-9][a-zA-Z0-9._-]*\.[a-zA-Z]{2,}(:[0-9]+)?' \
+    | sed 's/:[0-9]*$//' \
+    | grep -Ev 'example|localhost|invalid|\.local$')
+  [ -z "$_raw" ] && return
+  while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
+}
+
+module_caddy_roots() {
+  local _files=""
+  [ -f /etc/caddy/Caddyfile ] && _files="/etc/caddy/Caddyfile"
+  for f in /etc/caddy/Caddyfile.d/*.caddy /etc/caddy/*.caddy; do
+    [ -f "$f" ] && _files="$_files $f"
+  done
+  [ -z "$_files" ] && return
+
+  cat $_files 2>/dev/null | grep -v '^\s*#' | \
+  awk '
+    /^[a-zA-Z0-9]/ && /\./ && !/import|tls|encode|root|reverse_proxy|handle|log|php/ {
+      gsub(/\{.*/,""); gsub(/,/," "); gsub(/https?:\/\//,"");
+      n=split($0,a," ");
+      for(i=1;i<=n;i++) {
+        gsub(/:[0-9]+$/,"",a[i]);
+        if(a[i] ~ /[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}/) dom=a[i]
+      }
+    }
+    /reverse_proxy/ { gsub(/[;]/,"",$2); if(dom) printf "  \033[0;36m→\033[0m %-40s \033[2m→ proxy: %s\033[0m\n",dom,$2; dom="" }
+    /root \*/ { gsub(/[;]/,"",$3); if(dom) printf "  \033[0;36m→\033[0m %-40s \033[2m%s\033[0m\n",dom,$3; dom="" }
+    /^\}/ { dom="" }
+  '
+}
+
+# ============================================================
 # COLLECT DOMAINS berdasarkan engine
 # ============================================================
 collect_domains() {
@@ -272,6 +328,7 @@ collect_domains() {
     directadmin)   module_directadmin ;;
     plesk)         module_plesk ;;
     openlitespeed) module_openlitespeed ;;
+    caddy)         module_caddy ;;
     unknown)       module_nginx; module_apache ;; # fallback scan dua engine utama
   esac
   DOMAINS=($(printf '%s\n' "${DOMAINS[@]}" | sort -u))
@@ -291,6 +348,7 @@ show_webroots() {
     directadmin)   module_directadmin_roots ;;
     plesk)         module_plesk_roots ;;
     openlitespeed) module_openlitespeed_roots ;;
+    caddy)         module_caddy_roots ;;
     unknown)       module_nginx_roots; module_apache_roots ;;
   esac
 }
@@ -382,7 +440,7 @@ show_webroots
 # 5. RUNNING SERVICES
 # ============================================================
 header "RUNNING SERVICES"
-SERVICES=(nginx apache2 httpd lsws mysql mariadb postgresql php-fpm \
+SERVICES=(nginx apache2 httpd lsws caddy mysql mariadb postgresql php-fpm \
   php8.3-fpm php8.2-fpm php8.1-fpm php7.4-fpm fail2ban redis-server memcached)
 
 for SVC in "${SERVICES[@]}"; do
