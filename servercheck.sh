@@ -76,17 +76,6 @@ for DIR in /usr/local/ispconfig/server/conf /var/ispconfig; do
     | grep -v 'example\|localhost')
 done
 
-# Docker containers
-if command -v docker &>/dev/null; then
-  for CID in $(docker ps -q 2>/dev/null); do
-    while IFS= read -r domain; do
-      DOMAINS+=("$domain")
-    done < <(docker exec "$CID" bash -c \
-      "grep -rh 'ServerName\|server_name' /etc/apache2/sites-enabled/ /etc/nginx/ 2>/dev/null \
-       | grep -v '#' | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}'" 2>/dev/null \
-      | grep -v 'example\|localhost')
-  done
-fi
 
 # Deduplicate
 DOMAINS=($(printf '%s\n' "${DOMAINS[@]}" | sort -u))
@@ -220,20 +209,6 @@ else
   echo -e "  ${DIM}PostgreSQL tidak terinstall${NC}"
 fi
 
-# ============================================================
-# 7. DOCKER
-# ============================================================
-if command -v docker &>/dev/null; then
-  header "DOCKER"
-  RUNNING=$(docker ps -q 2>/dev/null | wc -l)
-  TOTAL=$(docker ps -aq 2>/dev/null | wc -l)
-  echo -e "  ${INFO} Containers: ${G}${RUNNING} running${NC} / ${TOTAL} total"
-  echo
-
-  docker ps --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null | while read -r line; do
-    echo -e "  ${DIM}${line}${NC}"
-  done
-fi
 
 # ============================================================
 # 8. SECURITY
@@ -287,20 +262,6 @@ for DIR in /etc/nginx/sites-enabled /etc/nginx/conf.d; do
   '
 done
 
-# Docker — satu exec per container, gabung domain+root dalam 1 perintah
-if command -v docker &>/dev/null; then
-  docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null | while read -r CID CNAME; do
-    docker exec "$CID" bash -c '
-      DOM=$(grep -rh "ServerName\|server_name" /etc/apache2/sites-enabled/ /etc/nginx/sites-enabled/ /etc/nginx/conf.d/ 2>/dev/null \
-        | grep -v "#" | grep -oE "[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}" | head -1)
-      ROOT=$(grep -rh "DocumentRoot\|^\s*root\s" /etc/apache2/sites-enabled/ /etc/nginx/sites-enabled/ /etc/nginx/conf.d/ 2>/dev/null \
-        | grep -v "#" | awk "{print \$2}" | tr -d ";\042" | head -1)
-      [ -n "$DOM" ] && echo "$DOM|${ROOT:-N/A}"
-    ' 2>/dev/null | while IFS='|' read -r DOM ROOT; do
-      printf "  \033[0;36m→\033[0m %-40s \033[2m[docker: %s] %s\033[0m\n" "$DOM" "$CNAME" "$ROOT"
-    done
-  done
-fi
 
 # ============================================================
 # SUMMARY
