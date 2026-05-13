@@ -4,7 +4,7 @@
 #  Rawon Hunter™ | github.com/bssn1337/domain-recon
 # ============================================================
 
-VERSION="2.1.2"
+VERSION="2.1.3"
 
 R='\033[0;31m' G='\033[0;32m' Y='\033[0;33m'
 C='\033[0;36m' W='\033[1;37m' DIM='\033[2m' NC='\033[0m'
@@ -85,7 +85,7 @@ module_apache() {
   [ -d /usr/local/apache/conf/vhosts ]   && DIRS+=("/usr/local/apache/conf/vhosts")
   [ ${#DIRS[@]} -eq 0 ] && return
 
-  _raw=$(grep -rh 'ServerName' "${DIRS[@]}" 2>/dev/null \
+  _raw=$(grep -Rh 'ServerName' "${DIRS[@]}" 2>/dev/null \
     | grep -v '^\s*#' \
     | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
     | grep -Ev 'example|localhost|invalid|\.local$')
@@ -114,16 +114,35 @@ module_apache_roots() {
 # ============================================================
 module_nginx() {
   local DIRS=() _raw _d
+
+  # Approach 1: grep -R (follow symlinks) pada sites-enabled & conf.d
   [ -d /etc/nginx/sites-enabled ] && DIRS+=("/etc/nginx/sites-enabled")
   [ -d /etc/nginx/conf.d ]        && DIRS+=("/etc/nginx/conf.d")
-  [ ${#DIRS[@]} -eq 0 ] && return
+  if [ ${#DIRS[@]} -gt 0 ]; then
+    _raw=$(grep -Rh 'server_name' "${DIRS[@]}" 2>/dev/null \
+      | grep -v '^\s*#' | grep -v 'if\s*(' \
+      | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
+      | grep -Ev 'example|localhost|invalid|\.local$')
+    [ -n "$_raw" ] && while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
+  fi
 
-  _raw=$(grep -rh 'server_name' "${DIRS[@]}" 2>/dev/null \
-    | grep -v '^\s*#' | grep -v 'if\s*(' \
-    | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
-    | grep -Ev 'example|localhost|invalid|\.local$')
-  [ -z "$_raw" ] && return
-  while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
+  # Approach 2: nginx -T jika approach 1 gagal
+  if [ ${#DOMAINS[@]} -eq 0 ] && nginx -T &>/dev/null; then
+    _raw=$(nginx -T 2>/dev/null \
+      | grep -v '^\s*#' | grep 'server_name' | grep -v 'if\s*(' \
+      | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
+      | grep -Ev 'example|localhost|invalid|\.local$')
+    [ -n "$_raw" ] && while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
+  fi
+
+  # Approach 3: PHP-FPM socket names sebagai fallback terakhir
+  if [ ${#DOMAINS[@]} -eq 0 ]; then
+    _raw=$(ls /run/php/php*-fpm-*.sock 2>/dev/null \
+      | sed 's|.*/php[0-9.]*-fpm-||; s/\.sock$//' \
+      | grep -E '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
+      | grep -Ev '^DOMAIN$|^NAMA_DOMAIN$|example|localhost')
+    [ -n "$_raw" ] && while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
+  fi
 }
 
 module_nginx_roots() {
