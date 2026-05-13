@@ -122,25 +122,22 @@ else
       *) HTTP_STATUS="${DIM}---${NC}" ;;
     esac
 
-    # SSL check
+    # SSL check — timeout 3s
     SSL_EXPIRE=""
     SSL_STATUS="${DIM}N/A${NC}"
     if command -v openssl &>/dev/null; then
-      SSL_INFO=$(echo | timeout 5 openssl s_client -servername "$DOMAIN" -connect "${DOMAIN}:443" 2>/dev/null \
+      SSL_INFO=$(echo | timeout 3 openssl s_client -servername "$DOMAIN" -connect "${DOMAIN}:443" 2>/dev/null \
         | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
       if [ -n "$SSL_INFO" ]; then
-        EXPIRE_EPOCH=$(date -d "$SSL_INFO" +%s 2>/dev/null || date -j -f "%b %d %H:%M:%S %Y %Z" "$SSL_INFO" +%s 2>/dev/null)
+        EXPIRE_EPOCH=$(date -d "$SSL_INFO" +%s 2>/dev/null)
         NOW_EPOCH=$(date +%s)
         DAYS_LEFT=$(( (EXPIRE_EPOCH - NOW_EPOCH) / 86400 ))
         if [ "$DAYS_LEFT" -lt 7 ]; then
-          SSL_STATUS="${R}KRITIS${NC}"
-          SSL_EXPIRE="${R}${DAYS_LEFT}d${NC}"
+          SSL_STATUS="${R}KRITIS${NC}"; SSL_EXPIRE="${R}${DAYS_LEFT}d${NC}"
         elif [ "$DAYS_LEFT" -lt 30 ]; then
-          SSL_STATUS="${Y}OK${NC}"
-          SSL_EXPIRE="${Y}${DAYS_LEFT}d${NC}"
+          SSL_STATUS="${Y}OK${NC}"; SSL_EXPIRE="${Y}${DAYS_LEFT}d${NC}"
         else
-          SSL_STATUS="${G}OK${NC}"
-          SSL_EXPIRE="${G}${DAYS_LEFT}d${NC}"
+          SSL_STATUS="${G}OK${NC}"; SSL_EXPIRE="${G}${DAYS_LEFT}d${NC}"
         fi
       fi
     fi
@@ -269,54 +266,39 @@ echo
 # ============================================================
 header "WEB ROOT LOCATIONS"
 
-# Apache / httpd
+# Apache / httpd — parse semua file sekaligus dengan awk
 for DIR in /etc/apache2/sites-enabled /etc/httpd/conf/sites-enabled /etc/httpd/conf.d; do
   [ -d "$DIR" ] || continue
-  grep -rh 'ServerName\|DocumentRoot' "$DIR" 2>/dev/null | grep -v '^\s*#' | while read -r line; do
-    if echo "$line" | grep -qi 'ServerName'; then
-      CURRENT_DOMAIN=$(echo "$line" | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' | head -1)
-    elif echo "$line" | grep -qi 'DocumentRoot'; then
-      DOCROOT=$(echo "$line" | awk '{print $2}' | tr -d '"')
-      [ -n "$CURRENT_DOMAIN" ] && [ -n "$DOCROOT" ] && \
-        printf "  ${INFO} %-40s ${DIM}%s${NC}\n" "$CURRENT_DOMAIN" "$DOCROOT"
-    fi
-  done
+  grep -rh 'ServerName\|DocumentRoot' "$DIR" 2>/dev/null | grep -v '^\s*#' | \
+  awk '
+    /[Ss]erver[Nn]ame/ { match($0, /[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}/); dom=substr($0,RSTART,RLENGTH) }
+    /[Dd]ocument[Rr]oot/ { gsub(/[";]/,"",$2); if(dom) printf "  \033[0;36m→\033[0m %-40s \033[2m%s\033[0m\n", dom, $2; dom="" }
+  '
 done
 
-# Nginx
+# Nginx — awk satu pass per dir, jauh lebih cepat dari loop bash
 for DIR in /etc/nginx/sites-enabled /etc/nginx/conf.d; do
   [ -d "$DIR" ] || continue
-  for CONF in "$DIR"/*.conf "$DIR"/*; do
-    [ -f "$CONF" ] || continue
-    CURRENT_DOMAIN=""
-    while IFS= read -r line; do
-      if echo "$line" | grep -q 'server_name' && ! echo "$line" | grep -q 'if\s*('; then
-        CURRENT_DOMAIN=$(echo "$line" | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' | head -1)
-      elif echo "$line" | grep -q '^\s*root\s'; then
-        DOCROOT=$(echo "$line" | awk '{print $2}' | tr -d ';')
-        [ -n "$CURRENT_DOMAIN" ] && [ -n "$DOCROOT" ] && \
-          printf "  ${INFO} %-40s ${DIM}%s${NC}\n" "$CURRENT_DOMAIN" "$DOCROOT"
-      elif echo "$line" | grep -q 'proxy_pass'; then
-        PROXY=$(echo "$line" | awk '{print $2}' | tr -d ';')
-        [ -n "$CURRENT_DOMAIN" ] && [ -n "$PROXY" ] && \
-          printf "  ${INFO} %-40s ${DIM}→ proxy: %s${NC}\n" "$CURRENT_DOMAIN" "$PROXY"
-        CURRENT_DOMAIN=""
-      fi
-    done < "$CONF"
-  done
+  grep -rh 'server_name\|^\s*root\s\|proxy_pass' "$DIR" 2>/dev/null | grep -v '^\s*#' | grep -v 'if\s*(' | \
+  awk '
+    /server_name/ { match($0, /[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}/); dom=substr($0,RSTART,RLENGTH) }
+    /^\s*root\s/  { gsub(/[;]/,"",$2); if(dom) { printf "  \033[0;36m→\033[0m %-40s \033[2m%s\033[0m\n", dom, $2; dom="" } }
+    /proxy_pass/  { gsub(/[;]/,"",$2); if(dom) { printf "  \033[0;36m→\033[0m %-40s \033[2m→ proxy: %s\033[0m\n", dom, $2; dom="" } }
+  '
 done
 
-# Docker containers web roots
+# Docker — satu exec per container, gabung domain+root dalam 1 perintah
 if command -v docker &>/dev/null; then
-  for CID in $(docker ps -q 2>/dev/null); do
-    CNAME=$(docker inspect --format '{{.Name}}' "$CID" | tr -d '/')
-    DOMAIN=$(docker exec "$CID" bash -c \
-      "grep -rh 'ServerName\|server_name' /etc/apache2/sites-enabled/ /etc/nginx/ 2>/dev/null \
-       | grep -v '#' | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' | head -1" 2>/dev/null)
-    DOCROOT=$(docker exec "$CID" bash -c \
-      "grep -rh 'DocumentRoot\|^\s*root\s' /etc/apache2/sites-enabled/ /etc/nginx/ 2>/dev/null \
-       | grep -v '#' | awk '{print \$2}' | tr -d ';\042' | head -1" 2>/dev/null)
-    [ -n "$DOMAIN" ] && printf "  ${INFO} %-40s ${DIM}[docker: %s] %s${NC}\n" "$DOMAIN" "$CNAME" "${DOCROOT:-N/A}"
+  docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null | while read -r CID CNAME; do
+    docker exec "$CID" bash -c '
+      DOM=$(grep -rh "ServerName\|server_name" /etc/apache2/sites-enabled/ /etc/nginx/sites-enabled/ /etc/nginx/conf.d/ 2>/dev/null \
+        | grep -v "#" | grep -oE "[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}" | head -1)
+      ROOT=$(grep -rh "DocumentRoot\|^\s*root\s" /etc/apache2/sites-enabled/ /etc/nginx/sites-enabled/ /etc/nginx/conf.d/ 2>/dev/null \
+        | grep -v "#" | awk "{print \$2}" | tr -d ";\042" | head -1)
+      [ -n "$DOM" ] && echo "$DOM|${ROOT:-N/A}"
+    ' 2>/dev/null | while IFS='|' read -r DOM ROOT; do
+      printf "  \033[0;36m→\033[0m %-40s \033[2m[docker: %s] %s\033[0m\n" "$DOM" "$CNAME" "$ROOT"
+    done
   done
 fi
 
