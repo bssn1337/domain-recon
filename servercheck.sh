@@ -4,7 +4,7 @@
 #  Rawon Hunter™ | github.com/bssn1337/domain-recon
 # ============================================================
 
-VERSION="2.1.1"
+VERSION="2.1.2"
 
 R='\033[0;31m' G='\033[0;32m' Y='\033[0;33m'
 C='\033[0;36m' W='\033[1;37m' DIM='\033[2m' NC='\033[0m'
@@ -78,21 +78,19 @@ detect_engine() {
 # MODULE: Apache / httpd
 # ============================================================
 module_apache() {
-  local DIRS=()
-  # Deteksi lokasi config Apache
+  local DIRS=() _raw _d
   [ -d /etc/apache2/sites-enabled ]      && DIRS+=("/etc/apache2/sites-enabled")
   [ -d /etc/httpd/conf/sites-enabled ]   && DIRS+=("/etc/httpd/conf/sites-enabled")
   [ -d /etc/httpd/conf.d ]               && DIRS+=("/etc/httpd/conf.d")
   [ -d /usr/local/apache/conf/vhosts ]   && DIRS+=("/usr/local/apache/conf/vhosts")
+  [ ${#DIRS[@]} -eq 0 ] && return
 
-  for DIR in "${DIRS[@]}"; do
-    while IFS= read -r domain; do
-      DOMAINS+=("$domain")
-    done < <(grep -rh 'ServerName' "$DIR" 2>/dev/null \
-      | grep -v '^\s*#' \
-      | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
-      | grep -Ev 'example|localhost|invalid|\.local$')
-  done
+  _raw=$(grep -rh 'ServerName' "${DIRS[@]}" 2>/dev/null \
+    | grep -v '^\s*#' \
+    | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
+    | grep -Ev 'example|localhost|invalid|\.local$')
+  [ -z "$_raw" ] && return
+  while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
 }
 
 module_apache_roots() {
@@ -115,76 +113,50 @@ module_apache_roots() {
 # MODULE: Nginx
 # ============================================================
 module_nginx() {
-  # Prioritas: nginx -T (dump semua config termasuk custom include path)
-  if nginx -T &>/dev/null; then
-    while IFS= read -r domain; do
-      DOMAINS+=("$domain")
-    done < <(nginx -T 2>/dev/null \
-      | grep -v '^\s*#' | grep 'server_name' | grep -v 'if\s*(' \
-      | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
-      | grep -Ev 'example|localhost|invalid|\.local$')
-    return
-  fi
-
-  # Fallback: scan dir standar
-  local DIRS=()
+  local DIRS=() _raw _d
   [ -d /etc/nginx/sites-enabled ] && DIRS+=("/etc/nginx/sites-enabled")
   [ -d /etc/nginx/conf.d ]        && DIRS+=("/etc/nginx/conf.d")
-  for DIR in "${DIRS[@]}"; do
-    while IFS= read -r domain; do
-      DOMAINS+=("$domain")
-    done < <(grep -rh 'server_name' "$DIR" 2>/dev/null \
-      | grep -v '^\s*#' | grep -v 'if\s*(' \
-      | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
-      | grep -Ev 'example|localhost|invalid|\.local$')
-  done
+  [ ${#DIRS[@]} -eq 0 ] && return
+
+  _raw=$(grep -rh 'server_name' "${DIRS[@]}" 2>/dev/null \
+    | grep -v '^\s*#' | grep -v 'if\s*(' \
+    | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
+    | grep -Ev 'example|localhost|invalid|\.local$')
+  [ -z "$_raw" ] && return
+  while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
 }
 
 module_nginx_roots() {
-  # Prioritas: nginx -T
-  if nginx -T &>/dev/null; then
-    nginx -T 2>/dev/null | grep -v '^\s*#' | grep -v 'if\s*(' | \
-    awk '
-      /server_name/ { match($0,/[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}/); dom=substr($0,RSTART,RLENGTH) }
-      /^\s*root\s/  { gsub(/[;]/,"",$2); if(dom){ printf "  \033[0;36m→\033[0m %-40s \033[2m%s\033[0m\n",dom,$2; dom="" } }
-      /proxy_pass/  { gsub(/[;]/,"",$2); if(dom){ printf "  \033[0;36m→\033[0m %-40s \033[2m→ proxy: %s\033[0m\n",dom,$2; dom="" } }
-    '
-    return
-  fi
-
-  # Fallback: scan dir standar
   local DIRS=()
   [ -d /etc/nginx/sites-enabled ] && DIRS+=("/etc/nginx/sites-enabled")
   [ -d /etc/nginx/conf.d ]        && DIRS+=("/etc/nginx/conf.d")
-  for DIR in "${DIRS[@]}"; do
-    grep -rh 'server_name\|^\s*root\s\|proxy_pass' "$DIR" 2>/dev/null \
-      | grep -v '^\s*#' | grep -v 'if\s*(' | \
-    awk '
-      /server_name/ { match($0,/[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}/); dom=substr($0,RSTART,RLENGTH) }
-      /^\s*root\s/  { gsub(/[;]/,"",$2); if(dom){ printf "  \033[0;36m→\033[0m %-40s \033[2m%s\033[0m\n",dom,$2; dom="" } }
-      /proxy_pass/  { gsub(/[;]/,"",$2); if(dom){ printf "  \033[0;36m→\033[0m %-40s \033[2m→ proxy: %s\033[0m\n",dom,$2; dom="" } }
-    '
-  done
+  [ ${#DIRS[@]} -eq 0 ] && return
+
+  grep -rh 'server_name\|^\s*root\s\|proxy_pass' "${DIRS[@]}" 2>/dev/null \
+    | grep -v '^\s*#' | grep -v 'if\s*(' | \
+  awk '
+    /server_name/ { match($0,/[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}/); dom=substr($0,RSTART,RLENGTH) }
+    /^\s*root\s/  { gsub(/[;]/,"",$2); if(dom){ printf "  \033[0;36m→\033[0m %-40s \033[2m%s\033[0m\n",dom,$2; dom="" } }
+    /proxy_pass/  { gsub(/[;]/,"",$2); if(dom){ printf "  \033[0;36m→\033[0m %-40s \033[2m→ proxy: %s\033[0m\n",dom,$2; dom="" } }
+  '
 }
 
 # ============================================================
 # MODULE: cPanel
 # ============================================================
 module_cpanel() {
-  # cPanel simpan vhost di userdata
-  while IFS= read -r domain; do
-    DOMAINS+=("$domain")
-  done < <(ls /var/cpanel/userdata/ 2>/dev/null | while read -r user; do
+  local _raw _d
+  _raw=$(ls /var/cpanel/userdata/ 2>/dev/null | while read -r user; do
     ls /var/cpanel/userdata/"$user"/ 2>/dev/null | grep -v '\.cache\|_SSL\|main'
   done | grep -E '\.' | grep -Ev 'example|localhost')
+  [ -n "$_raw" ] && while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
 
-  # Fallback: httpd conf
-  [ -d /etc/apache2/conf.d/userdata ] && \
-    while IFS= read -r domain; do
-      DOMAINS+=("$domain")
-    done < <(grep -rh 'ServerName' /etc/apache2/conf.d/userdata/ 2>/dev/null \
+  if [ -d /etc/apache2/conf.d/userdata ]; then
+    _raw=$(grep -rh 'ServerName' /etc/apache2/conf.d/userdata/ 2>/dev/null \
       | grep -v '#' | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
       | grep -Ev 'example|localhost')
+    [ -n "$_raw" ] && while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
+  fi
 }
 
 module_cpanel_roots() {
@@ -203,15 +175,15 @@ module_cpanel_roots() {
 # MODULE: ISPConfig
 # ============================================================
 module_ispconfig() {
+  local _raw _d KEY
   for DIR in /etc/apache2/sites-enabled /etc/nginx/sites-enabled; do
     [ -d "$DIR" ] || continue
-    local KEY='ServerName'; [ "$DIR" = "/etc/nginx/sites-enabled" ] && KEY='server_name'
-    while IFS= read -r domain; do
-      DOMAINS+=("$domain")
-    done < <(grep -rh "$KEY" "$DIR" 2>/dev/null \
+    KEY='ServerName'; [ "$DIR" = "/etc/nginx/sites-enabled" ] && KEY='server_name'
+    _raw=$(grep -rh "$KEY" "$DIR" 2>/dev/null \
       | grep -v '#' | grep -v 'if\s*(' \
       | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
       | grep -Ev 'example|localhost')
+    [ -n "$_raw" ] && while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
   done
 }
 
@@ -219,9 +191,9 @@ module_ispconfig() {
 # MODULE: DirectAdmin
 # ============================================================
 module_directadmin() {
-  while IFS= read -r domain; do
-    DOMAINS+=("$domain")
-  done < <(ls /home/*/domains/ 2>/dev/null | grep -E '\.' | grep -Ev 'example|localhost')
+  local _raw _d
+  _raw=$(ls /home/*/domains/ 2>/dev/null | grep -E '\.' | grep -Ev 'example|localhost')
+  [ -n "$_raw" ] && while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
 }
 
 module_directadmin_roots() {
@@ -236,10 +208,10 @@ module_directadmin_roots() {
 # MODULE: Plesk
 # ============================================================
 module_plesk() {
-  while IFS= read -r domain; do
-    DOMAINS+=("$domain")
-  done < <(ls /var/www/vhosts/ 2>/dev/null \
+  local _raw _d
+  _raw=$(ls /var/www/vhosts/ 2>/dev/null \
     | grep -E '\.' | grep -Ev 'example|localhost|default|system')
+  [ -n "$_raw" ] && while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
 }
 
 module_plesk_roots() {
@@ -253,11 +225,11 @@ module_plesk_roots() {
 # MODULE: OpenLiteSpeed
 # ============================================================
 module_openlitespeed() {
-  while IFS= read -r domain; do
-    DOMAINS+=("$domain")
-  done < <(grep -rh 'domainName' /usr/local/lsws/conf/vhosts/ 2>/dev/null \
+  local _raw _d
+  _raw=$(grep -rh 'domainName' /usr/local/lsws/conf/vhosts/ 2>/dev/null \
     | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
     | grep -Ev 'example|localhost')
+  [ -n "$_raw" ] && while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
 }
 
 module_openlitespeed_roots() {
