@@ -4,7 +4,7 @@
 #  Rawon Hunter™ | github.com/bssn1337/domain-recon
 # ============================================================
 
-VERSION="2.4.0"
+VERSION="2.5.0"
 
 R='\033[0;31m' G='\033[0;32m' Y='\033[0;33m'
 C='\033[0;36m' W='\033[1;37m' DIM='\033[2m' NC='\033[0m'
@@ -423,55 +423,113 @@ show_webroots() {
 # ============================================================
 # DOMAIN CMS FINGERPRINT (passive homepage check)
 # ============================================================
-detect_cms() {
-  local _domain="$1" _tmp_body _tmp_headers _code _cms _combined
-  _tmp_body=$(mktemp 2>/dev/null) || { echo "Unknown"; return; }
-  _tmp_headers=$(mktemp 2>/dev/null) || { rm -f "$_tmp_body"; echo "Unknown"; return; }
+detect_stack() {
+  local _domain="$1" _body _headers _status _tech _server _powered _cookies _all
+  _body=$(mktemp 2>/dev/null) || { printf 'Unknown'; return; }
+  _headers=$(mktemp 2>/dev/null) || { rm -f "$_body"; printf 'Unknown'; return; }
 
-  _code=$(curl -k -L -sS --connect-timeout 4 --max-time 8 \
-    -A "ServerCheck-CMS-Fingerprint/2.4" \
-    -D "$_tmp_headers" -o "$_tmp_body" -w '%{http_code}' \
+  # Ambil homepage saja; tidak crawling dan tidak enumerasi path.
+  _status=$(curl -k -L -sS --connect-timeout 4 --max-time 9 \
+    -A "ServerCheck-Technology-Fingerprint/2.5" \
+    -D "$_headers" -o "$_body" -w '%{http_code}' \
     "https://${_domain}/" 2>/dev/null)
 
-  if [ -z "$_code" ] || [ "$_code" = "000" ]; then
-    : > "$_tmp_headers"
-    _code=$(curl -L -sS --connect-timeout 4 --max-time 8 \
-      -A "ServerCheck-CMS-Fingerprint/2.4" \
-      -D "$_tmp_headers" -o "$_tmp_body" -w '%{http_code}' \
+  if [ -z "$_status" ] || [ "$_status" = "000" ]; then
+    : > "$_headers"
+    _status=$(curl -L -sS --connect-timeout 4 --max-time 9 \
+      -A "ServerCheck-Technology-Fingerprint/2.5" \
+      -D "$_headers" -o "$_body" -w '%{http_code}' \
       "http://${_domain}/" 2>/dev/null)
   fi
 
-  _combined="${_tmp_headers} ${_tmp_body}"
-  _cms="Tidak terdeteksi"
+  _tech=""
+  _server=$(awk 'tolower($1)=="server:" {$1=""; sub(/^[ \t]+/,""); gsub(/\r/,""); print; exit}' "$_headers")
+  _powered=$(awk 'tolower($1)=="x-powered-by:" {$1=""; sub(/^[ \t]+/,""); gsub(/\r/,""); print; exit}' "$_headers")
+  _cookies=$(awk 'tolower($1)=="set-cookie:" {print tolower($0)}' "$_headers")
+  _all="$_headers $_body"
 
-  if grep -Eqi 'wp-content/|wp-includes/|<meta[^>]+generator[^>]+WordPress|wordpress' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
-    _cms="WordPress"
-  elif grep -Eqi 'content="Joomla|com_content|/media/system/js/|Joomla!' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
-    _cms="Joomla"
-  elif grep -Eqi 'Drupal.settings|/sites/default/files/|content="Drupal|X-Generator: Drupal' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
-    _cms="Drupal"
-  elif grep -Eqi 'Magento|mage-cache|/static/version[0-9]+/' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
-    _cms="Magento"
-  elif grep -Eqi 'cdn.shopify.com|Shopify.theme|shopify-section' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
-    _cms="Shopify"
-  elif grep -Eqi 'PrestaShop|prestashop' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
-    _cms="PrestaShop"
-  elif grep -Eqi 'catalog/view/theme|OpenCart' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
-    _cms="OpenCart"
-  elif grep -Eqi 'ghost-url|content="Ghost|/ghost/api/' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
-    _cms="Ghost"
-  elif grep -Eqi 'Moodle|/theme/yui_combo.php' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
-    _cms="Moodle"
-  elif grep -Eqi 'TYPO3|typo3temp|/typo3/' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
-    _cms="TYPO3"
-  elif grep -Eqi 'content="Wix|wixstatic.com|X-Wix-' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
-    _cms="Wix"
-  elif grep -Eqi 'squarespace.com|static1.squarespace.com' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
-    _cms="Squarespace"
+  add_stack() {
+    case ";$_tech;" in *";$1;"*) ;; *)
+      if [ -z "$_tech" ]; then _tech="$1"; else _tech="${_tech} | $1"; fi
+    esac
+  }
+  has_sig() { grep -Eqi "$1" "$_headers" "$_body" 2>/dev/null; }
+
+  # CMS
+  if has_sig 'wp-content/|wp-includes/|generator[^>]+WordPress|wordpress'; then
+    add_stack "CMS: WordPress"
+  elif has_sig 'com_content|/media/system/js/|content="Joomla|Joomla!'; then
+    add_stack "CMS: Joomla"
+  elif has_sig 'Drupal.settings|/sites/default/files/|content="Drupal|X-Generator: Drupal'; then
+    add_stack "CMS: Drupal"
+  elif has_sig 'mage-cache|Magento|/static/version[0-9]+/'; then
+    add_stack "CMS: Magento"
+  elif has_sig 'cdn.shopify.com|Shopify.theme|shopify-section'; then
+    add_stack "CMS: Shopify"
+  elif has_sig 'PrestaShop|prestashop'; then
+    add_stack "CMS: PrestaShop"
+  elif has_sig 'catalog/view/theme|OpenCart'; then
+    add_stack "CMS: OpenCart"
+  elif has_sig 'ghost-url|content="Ghost|/ghost/api/'; then
+    add_stack "CMS: Ghost"
+  elif has_sig 'Moodle|/theme/yui_combo.php'; then
+    add_stack "CMS: Moodle"
+  elif has_sig 'TYPO3|typo3temp|/typo3/'; then
+    add_stack "CMS: TYPO3"
+  elif has_sig 'wixstatic.com|X-Wix-|content="Wix'; then
+    add_stack "CMS: Wix"
+  elif has_sig 'squarespace.com|static1.squarespace.com'; then
+    add_stack "CMS: Squarespace"
   fi
 
-  rm -f "$_tmp_body" "$_tmp_headers"
-  printf '%s' "$_cms"
+  # Backend language / framework indicators
+  if printf '%s' "$_powered" | grep -Eqi 'PHP' || \
+     printf '%s' "$_cookies" | grep -Eqi 'PHPSESSID' || \
+     has_sig 'PHPSESSID|\.php([?/]|$)|X-Powered-By:[[:space:]]*PHP'; then
+    add_stack "Backend: PHP"
+  fi
+  if printf '%s' "$_powered" | grep -Eqi 'Express' || \
+     printf '%s' "$_cookies" | grep -Eqi 'connect\.sid' || \
+     has_sig 'X-Powered-By:[[:space:]]*Express|connect\.sid'; then
+    add_stack "Backend: Node.js/Express"
+  fi
+  if has_sig 'laravel_session|laravel_cookie'; then add_stack "Framework: Laravel"; fi
+  if has_sig 'ci_session|CodeIgniter'; then add_stack "Framework: CodeIgniter"; fi
+  if has_sig 'Symfony|sf-toolbar'; then add_stack "Framework: Symfony"; fi
+  if has_sig 'django|csrftoken'; then add_stack "Framework: Django (indikasi)"; fi
+  if has_sig 'ASP\.NET|__VIEWSTATE|\.aspx'; then add_stack "Backend: ASP.NET"; fi
+  if has_sig 'JSESSIONID|Spring'; then add_stack "Backend: Java/Spring (indikasi)"; fi
+  if has_sig 'rack\.session|csrf-token.*Rails'; then add_stack "Framework: Ruby on Rails (indikasi)"; fi
+
+  # JavaScript frameworks / meta-frameworks
+  if has_sig '__NEXT_DATA__|/_next/static/|next\.js'; then add_stack "JS: Next.js"; fi
+  if has_sig '__NUXT__|/_nuxt/|nuxt\.js'; then add_stack "JS: Nuxt"; fi
+  if has_sig 'react-dom|react\.production|data-reactroot|__REACT'; then add_stack "JS: React"; fi
+  if has_sig 'vue(\.runtime)?(\.global)?(\.min)?\.js|__VUE__|data-v-[a-f0-9]'; then add_stack "JS: Vue"; fi
+  if has_sig 'ng-version|angular(\.min)?\.js|ng-app='; then add_stack "JS: Angular"; fi
+  if has_sig 'svelte-[a-z0-9]+|__svelte'; then add_stack "JS: Svelte"; fi
+  if has_sig 'astro-island|astro\.js'; then add_stack "JS: Astro"; fi
+  if has_sig 'vite/client|@vite/client'; then add_stack "Build: Vite"; fi
+  if has_sig 'webpackJsonp|webpack-runtime|webpackChunk'; then add_stack "Build: Webpack"; fi
+  if has_sig 'jquery(\.min)?\.js|jQuery v'; then add_stack "JS: jQuery"; fi
+  if has_sig 'bootstrap(\.min)?\.(css|js)'; then add_stack "UI: Bootstrap"; fi
+  if has_sig 'tailwindcss|tailwind\.min\.css'; then add_stack "CSS: Tailwind"; fi
+  if has_sig 'alpine(\.min)?\.js|x-data='; then add_stack "JS: Alpine.js"; fi
+  if has_sig 'htmx(\.min)?\.js|hx-get='; then add_stack "JS: htmx"; fi
+
+  # Web server / reverse proxy headers
+  case "$_server" in
+    *nginx*|*Nginx*) add_stack "Server: Nginx" ;;
+    *Apache*|*apache*) add_stack "Server: Apache" ;;
+    *LiteSpeed*|*litespeed*) add_stack "Server: LiteSpeed" ;;
+    *Microsoft-IIS*|*IIS*) add_stack "Server: IIS" ;;
+    *Caddy*) add_stack "Server: Caddy" ;;
+  esac
+  if [ -n "$_powered" ]; then add_stack "X-Powered-By: $_powered"; fi
+
+  [ -z "$_tech" ] && _tech="Tidak terdeteksi"
+  rm -f "$_body" "$_headers"
+  printf '%s' "$_tech"
 }
 
 # ============================================================
@@ -508,7 +566,7 @@ echo -e "  ${INFO} Ditemukan ${W}${#DOMAINS[@]}${NC} domain\n"
 if [ ${#DOMAINS[@]} -eq 0 ]; then
   echo -e "  ${WARN} Tidak ada domain terdeteksi"
 else
-  printf "  %-36s %-14s %-6s %-6s %-8s %s\n" "DOMAIN" "DNS" "HTTP" "SSL" "EXPIRE" "CMS"
+  printf "  %-36s %-14s %-6s %-6s %-8s %s\n" "DOMAIN" "DNS" "HTTP" "SSL" "EXPIRE" "TECH STACK / CMS"
   divider
 
   for DOMAIN in "${DOMAINS[@]}"; do
@@ -549,8 +607,8 @@ else
     fi
 
     # CMS fingerprint dari homepage publik (GET terbatas, tanpa crawling).
-    CMS=$(detect_cms "$DOMAIN")
-    printf "  %-36s %-14b %-6b %-6b %-8b %s\n" "$DOMAIN" "$DNS_STATUS" "$HTTP_STATUS" "$SSL_STATUS" "$SSL_EXPIRE" "$CMS"
+    STACK=$(detect_stack "$DOMAIN")
+    printf "  %-36s %-14b %-6b %-6b %-8b %s\n" "$DOMAIN" "$DNS_STATUS" "$HTTP_STATUS" "$SSL_STATUS" "$SSL_EXPIRE" "$STACK"
   done
 fi
 
