@@ -51,19 +51,26 @@ fetch() {
   fi
 }
 
-# Load target list: explicit file, piped stdin, or domains.txt from this GitHub repository.
+# Load target list
 if [ -n "$INPUT_FILE" ]; then
-  if [ ! -r "$INPUT_FILE" ]; then log "ERROR: cannot read input file: $INPUT_FILE"; exit 1; fi
-  cp "$INPUT_FILE" "$TMP/domains.txt"
-elif [ ! -t 0 ]; then
-  cat > "$TMP/domains.txt"
+    if [ ! -r "$INPUT_FILE" ]; then
+        log "ERROR: cannot read input file: $INPUT_FILE"
+        exit 1
+    fi
+    cp "$INPUT_FILE" "$TMP/domains.txt"
 else
-  log "Downloading domain inventory: $DOMAINS_URL"
-  if ! fetch "$DOMAINS_URL" "$TMP/domains.txt" 20; then
-    log "ERROR: cannot download domains.txt."
-    log "Upload domains.txt to ${REPO_RAW}/domains.txt or run: bash servercheck.sh domains.txt"
+    log "Downloading domain inventory: $DOMAINS_URL"
+
+    if ! fetch "$DOMAINS_URL" "$TMP/domains.txt" 20; then
+        log "ERROR: failed to download domains.txt"
+        exit 1
+    fi
+fi
+
+if [ ! -s "$TMP/domains.txt" ]; then
+    log "ERROR: domains.txt is empty"
     exit 1
-  fi
+fi
 fi
 
 # Normalize and validate hostnames. Ignore blank lines and comments.
