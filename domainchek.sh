@@ -1,396 +1,696 @@
-#!/usr/bin/env bash
-# Domain Technology Scanner - portable Bash edition
-# Bash 3.2+ | Passive DNS, HTTP(S), TLS and technology fingerprinting.
-# No exploitation, brute force, directory enumeration, login attempts or config changes.
+#!/bin/bash
+# ============================================================
+#  servercheck.sh — Modular Server & Domain Checker
+#  Rawon Hunter™ | github.com/bssn1337/domain-recon
+# ============================================================
 
-set -u
-umask 077
+VERSION="2.4.0"
 
-VERSION="1.2.0"
-REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/bssn1337/domain-recon/main}"
-DOMAINS_URL="${DOMAINS_URL:-${REPO_RAW}/domains.txt}"
-OUTDIR="${OUTDIR:-domain-recon-report}"
-TIMEOUT="${TIMEOUT:-12}"
-CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-6}"
-MAX_DOMAINS="${MAX_DOMAINS:-500}"
-USER_AGENT="DomainRecon-Bash/${VERSION}"
+R='\033[0;31m' G='\033[0;32m' Y='\033[0;33m'
+C='\033[0;36m' W='\033[1;37m' DIM='\033[2m' NC='\033[0m'
+PASS="${G}✓${NC}" FAIL="${R}✗${NC}" WARN="${Y}!${NC}" INFO="${C}→${NC}"
 
-log() { printf '%s\n' "$*" >&2; }
-have() { command -v "$1" >/dev/null 2>&1; }
+divider() { echo -e "${DIM}$(printf '─%.0s' {1..65})${NC}"; }
+header()  { echo; divider; echo -e "  ${W}$1${NC}"; divider; }
 
-csv_escape() {
-    _v=$(printf '%s' "$1" | sed 's/"/""/g')
-    printf '"%s"' "$_v"
+DOMAINS=()
+WEB_ENGINE=""
+
+# ============================================================
+# DETECT: Web server engine yang aktif
+# ============================================================
+detect_engine() {
+  header "WEB ENGINE DETECTION"
+
+  # Urutan prioritas deteksi
+  if systemctl is-active --quiet lsws 2>/dev/null || \
+     pgrep -x litespeed &>/dev/null || pgrep -x lshttpd &>/dev/null; then
+    WEB_ENGINE="openlitespeed"
+    echo -e "  ${PASS} Terdeteksi: ${W}OpenLiteSpeed${NC}"
+
+  elif [ -d /usr/local/cpanel ] || command -v whmapi1 &>/dev/null || \
+       [ -f /etc/cpanel/cpanel.config ]; then
+    WEB_ENGINE="cpanel"
+    echo -e "  ${PASS} Terdeteksi: ${W}cPanel/WHM${NC}"
+    # cPanel pakai Apache di balik
+    if systemctl is-active --quiet httpd 2>/dev/null || \
+       systemctl is-active --quiet apache2 2>/dev/null; then
+      echo -e "  ${INFO} Web server  : Apache (via cPanel)"
+    fi
+
+  elif [ -d /usr/local/directadmin ] || command -v directadmin &>/dev/null; then
+    WEB_ENGINE="directadmin"
+    echo -e "  ${PASS} Terdeteksi: ${W}DirectAdmin${NC}"
+
+  elif [ -d /usr/local/ispconfig ] || [ -f /usr/local/ispconfig/server/lib/config.inc.php ]; then
+    WEB_ENGINE="ispconfig"
+    echo -e "  ${PASS} Terdeteksi: ${W}ISPConfig${NC}"
+
+  elif [ -d /usr/local/plesk ] || command -v plesk &>/dev/null; then
+    WEB_ENGINE="plesk"
+    echo -e "  ${PASS} Terdeteksi: ${W}Plesk${NC}"
+
+  elif [ -d /home/runcloud ] || command -v runcloud &>/dev/null || \
+       [ -d /etc/nginx-rc ] || [ -d /etc/apache2-rc ]; then
+    WEB_ENGINE="runcloud"
+    echo -e "  ${PASS} Terdeteksi: ${W}RunCloud${NC}"
+    if systemctl is-active --quiet nginx-rc 2>/dev/null || pgrep -x nginx &>/dev/null; then
+      echo -e "  ${INFO} Web server  : Nginx RC"
+    elif systemctl is-active --quiet apache2-rc 2>/dev/null || \
+         systemctl is-active --quiet apache2 2>/dev/null || pgrep -x apache2 &>/dev/null; then
+      echo -e "  ${INFO} Web server  : Apache RC"
+    fi
+
+  elif systemctl is-active --quiet caddy 2>/dev/null || \
+       pgrep -x caddy &>/dev/null; then
+    WEB_ENGINE="caddy"
+    echo -e "  ${PASS} Terdeteksi: ${W}Caddy${NC}"
+
+  elif systemctl is-active --quiet nginx 2>/dev/null || \
+       pgrep -x nginx &>/dev/null; then
+    # Nginx bisa jadi standalone atau reverse proxy Apache
+    if systemctl is-active --quiet apache2 2>/dev/null || \
+       systemctl is-active --quiet httpd 2>/dev/null; then
+      WEB_ENGINE="nginx+apache"
+      echo -e "  ${PASS} Terdeteksi: ${W}Nginx + Apache${NC} (Nginx sebagai reverse proxy)"
+    else
+      WEB_ENGINE="nginx"
+      echo -e "  ${PASS} Terdeteksi: ${W}Nginx${NC}"
+    fi
+
+  elif systemctl is-active --quiet apache2 2>/dev/null || \
+       systemctl is-active --quiet httpd 2>/dev/null || \
+       pgrep -x apache2 &>/dev/null || pgrep -x httpd &>/dev/null; then
+    WEB_ENGINE="apache"
+    echo -e "  ${PASS} Terdeteksi: ${W}Apache${NC}"
+
+  else
+    WEB_ENGINE="unknown"
+    echo -e "  ${WARN} Tidak ada web server aktif terdeteksi"
+  fi
 }
 
-json_escape() {
-    # Escape backslash, quote and line breaks using awk; no jq/Python required.
-    printf '%s' "$1" | awk 'BEGIN{ORS=""} {
-        gsub(/\\/, "\\\\"); gsub(/"/, "\\\"");
-        gsub(/\r/, ""); if (NR > 1) printf "\\n"; printf "%s", $0
-    }'
+# ============================================================
+# MODULE: Apache / httpd
+# ============================================================
+module_apache() {
+  local DIRS=() _raw _d
+  [ -d /etc/apache2/sites-enabled ]      && DIRS+=("/etc/apache2/sites-enabled")
+  [ -d /etc/httpd/conf/sites-enabled ]   && DIRS+=("/etc/httpd/conf/sites-enabled")
+  [ -d /etc/httpd/conf.d ]               && DIRS+=("/etc/httpd/conf.d")
+  [ -d /usr/local/apache/conf/vhosts ]   && DIRS+=("/usr/local/apache/conf/vhosts")
+  [ ${#DIRS[@]} -eq 0 ] && return
+
+  _raw=$(grep -Rh 'ServerName' "${DIRS[@]}" 2>/dev/null \
+    | grep -v '^\s*#' \
+    | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
+    | grep -Ev 'example|localhost|invalid|\.local$')
+  [ -z "$_raw" ] && return
+  while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
 }
 
-html_escape() {
-    printf '%s' "$1" |
-        sed 's/\&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'
+module_apache_roots() {
+  local DIRS=()
+  [ -d /etc/apache2/sites-enabled ]    && DIRS+=("/etc/apache2/sites-enabled")
+  [ -d /etc/httpd/conf/sites-enabled ] && DIRS+=("/etc/httpd/conf/sites-enabled")
+  [ -d /etc/httpd/conf.d ]             && DIRS+=("/etc/httpd/conf.d")
+  [ -d /usr/local/apache/conf/vhosts ] && DIRS+=("/usr/local/apache/conf/vhosts")
+
+  for DIR in "${DIRS[@]}"; do
+    grep -rh 'ServerName\|DocumentRoot' "$DIR" 2>/dev/null | grep -v '^\s*#' | \
+    awk '
+      /[Ss]erver[Nn]ame/ { match($0,/[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}/); dom=substr($0,RSTART,RLENGTH) }
+      /[Dd]ocument[Rr]oot/ { gsub(/[";]/,"",$2); if(dom) printf "  \033[0;36m→\033[0m %-40s \033[2m%s\033[0m\n",dom,$2; dom="" }
+    '
+  done
 }
 
-if ! have curl && ! have wget; then
-    log "ERROR: curl atau wget wajib tersedia."
-    exit 1
+# ============================================================
+# MODULE: Nginx
+# ============================================================
+module_nginx() {
+  local DIRS=() _raw _d
+
+  # Approach 1: grep -R (follow symlinks) pada sites-enabled & conf.d
+  [ -d /etc/nginx/sites-enabled ] && DIRS+=("/etc/nginx/sites-enabled")
+  [ -d /etc/nginx/conf.d ]        && DIRS+=("/etc/nginx/conf.d")
+  if [ ${#DIRS[@]} -gt 0 ]; then
+    _raw=$(grep -Rh 'server_name' "${DIRS[@]}" 2>/dev/null \
+      | grep -v '^\s*#' | grep -v 'if\s*(' \
+      | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
+      | grep -Ev 'example|localhost|invalid|\.local$')
+    [ -n "$_raw" ] && while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
+  fi
+
+  # Approach 2: nginx -T jika approach 1 gagal
+  if [ ${#DOMAINS[@]} -eq 0 ] && nginx -T &>/dev/null; then
+    _raw=$(nginx -T 2>/dev/null \
+      | grep -v '^\s*#' | grep 'server_name' | grep -v 'if\s*(' \
+      | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
+      | grep -Ev 'example|localhost|invalid|\.local$')
+    [ -n "$_raw" ] && while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
+  fi
+
+  # Approach 3: PHP-FPM socket names sebagai fallback terakhir
+  if [ ${#DOMAINS[@]} -eq 0 ]; then
+    _raw=$(ls /run/php/php*-fpm-*.sock 2>/dev/null \
+      | sed 's|.*/php[0-9.]*-fpm-||; s/\.sock$//' \
+      | grep -E '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
+      | grep -Ev '^DOMAIN$|^NAMA_DOMAIN$|example|localhost')
+    [ -n "$_raw" ] && while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
+  fi
+}
+
+module_nginx_roots() {
+  local DIRS=()
+  [ -d /etc/nginx/sites-enabled ] && DIRS+=("/etc/nginx/sites-enabled")
+  [ -d /etc/nginx/conf.d ]        && DIRS+=("/etc/nginx/conf.d")
+  [ ${#DIRS[@]} -eq 0 ] && return
+
+  grep -rh 'server_name\|^\s*root\s\|proxy_pass' "${DIRS[@]}" 2>/dev/null \
+    | grep -v '^\s*#' | grep -v 'if\s*(' | \
+  awk '
+    /server_name/ { match($0,/[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}/); dom=substr($0,RSTART,RLENGTH) }
+    /^\s*root\s/  { gsub(/[;]/,"",$2); if(dom){ printf "  \033[0;36m→\033[0m %-40s \033[2m%s\033[0m\n",dom,$2; dom="" } }
+    /proxy_pass/  { gsub(/[;]/,"",$2); if(dom){ printf "  \033[0;36m→\033[0m %-40s \033[2m→ proxy: %s\033[0m\n",dom,$2; dom="" } }
+  '
+}
+
+# ============================================================
+# MODULE: cPanel
+# ============================================================
+module_cpanel() {
+  local _raw _d
+  _raw=$(ls /var/cpanel/userdata/ 2>/dev/null | while read -r user; do
+    ls /var/cpanel/userdata/"$user"/ 2>/dev/null | grep -v '\.cache\|_SSL\|main'
+  done | grep -E '\.' | grep -Ev 'example|localhost')
+  [ -n "$_raw" ] && while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
+
+  if [ -d /etc/apache2/conf.d/userdata ]; then
+    _raw=$(grep -rh 'ServerName' /etc/apache2/conf.d/userdata/ 2>/dev/null \
+      | grep -v '#' | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
+      | grep -Ev 'example|localhost')
+    [ -n "$_raw" ] && while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
+  fi
+}
+
+module_cpanel_roots() {
+  ls /var/cpanel/userdata/ 2>/dev/null | while read -r user; do
+    for DOMAIN_FILE in /var/cpanel/userdata/"$user"/*/; do
+      DOM=$(basename "$DOMAIN_FILE")
+      [[ "$DOM" =~ \. ]] || continue
+      [[ "$DOM" =~ _SSL$|\.cache$ ]] && continue
+      ROOT=$(grep 'documentroot' /var/cpanel/userdata/"$user"/"$DOM" 2>/dev/null | awk '{print $2}')
+      [ -n "$ROOT" ] && printf "  ${INFO} %-40s ${DIM}%s${NC}\n" "$DOM" "$ROOT"
+    done
+  done
+}
+
+# ============================================================
+# MODULE: ISPConfig
+# ============================================================
+module_ispconfig() {
+  local _raw _d KEY
+  for DIR in /etc/apache2/sites-enabled /etc/nginx/sites-enabled; do
+    [ -d "$DIR" ] || continue
+    KEY='ServerName'; [ "$DIR" = "/etc/nginx/sites-enabled" ] && KEY='server_name'
+    _raw=$(grep -rh "$KEY" "$DIR" 2>/dev/null \
+      | grep -v '#' | grep -v 'if\s*(' \
+      | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
+      | grep -Ev 'example|localhost')
+    [ -n "$_raw" ] && while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
+  done
+}
+
+# ============================================================
+# MODULE: DirectAdmin
+# ============================================================
+module_directadmin() {
+  local _raw _d
+  _raw=$(ls /home/*/domains/ 2>/dev/null | grep -E '\.' | grep -Ev 'example|localhost')
+  [ -n "$_raw" ] && while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
+}
+
+module_directadmin_roots() {
+  for USER_DIR in /home/*/domains/*/; do
+    DOM=$(echo "$USER_DIR" | awk -F/ '{print $(NF-1)}')
+    ROOT="${USER_DIR}public_html"
+    [ -d "$ROOT" ] && printf "  ${INFO} %-40s ${DIM}%s${NC}\n" "$DOM" "$ROOT"
+  done
+}
+
+# ============================================================
+# MODULE: Plesk
+# ============================================================
+module_plesk() {
+  local _raw _d
+  _raw=$(ls /var/www/vhosts/ 2>/dev/null \
+    | grep -E '\.' | grep -Ev 'example|localhost|default|system')
+  [ -n "$_raw" ] && while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
+}
+
+module_plesk_roots() {
+  for d in /var/www/vhosts/*/httpdocs; do
+    DOM=$(echo "$d" | awk -F/ '{print $5}')
+    printf "  ${INFO} %-40s ${DIM}%s${NC}\n" "$DOM" "$d"
+  done
+}
+
+# ============================================================
+# MODULE: OpenLiteSpeed
+# ============================================================
+module_openlitespeed() {
+  local _raw _d
+  _raw=$(grep -rh 'domainName' /usr/local/lsws/conf/vhosts/ 2>/dev/null \
+    | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
+    | grep -Ev 'example|localhost')
+  [ -n "$_raw" ] && while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
+}
+
+module_openlitespeed_roots() {
+  grep -rh 'domainName\|docRoot' /usr/local/lsws/conf/vhosts/ 2>/dev/null | \
+  awk '
+    /domainName/ { match($0,/[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}/); dom=substr($0,RSTART,RLENGTH) }
+    /docRoot/    { gsub(/[<>]/,"",$2); if(dom){ printf "  \033[0;36m→\033[0m %-40s \033[2m%s\033[0m\n",dom,$2; dom="" } }
+  '
+}
+
+# ============================================================
+# MODULE: Caddy
+# ============================================================
+module_caddy() {
+  local _raw _d
+  # Kumpulkan semua Caddyfile (main + include .d/*.caddy)
+  local _files=""
+  [ -f /etc/caddy/Caddyfile ] && _files="/etc/caddy/Caddyfile"
+  for f in /etc/caddy/Caddyfile.d/*.caddy /etc/caddy/*.caddy; do
+    [ -f "$f" ] && _files="$_files $f"
+  done
+  [ -z "$_files" ] && return
+
+  # Domain di Caddy = baris yang dimulai dengan hostname (bukan directive)
+  # Format: "domain.com {" atau "domain1.com, domain2.com {"
+  _raw=$(grep -Eh '^[a-zA-Z0-9]' $_files 2>/dev/null \
+    | grep -v '^\s*#' \
+    | grep '\.' \
+    | grep -v 'import\|tls\|encode\|root\|file_server\|reverse_proxy\|handle\|log\|php' \
+    | sed 's/{.*//; s/,/ /g; s/https\?:\/\///g' \
+    | grep -oE '[a-zA-Z0-9][a-zA-Z0-9._-]*\.[a-zA-Z]{2,}(:[0-9]+)?' \
+    | sed 's/:[0-9]*$//' \
+    | grep -Ev 'example|localhost|invalid|\.local$')
+  [ -z "$_raw" ] && return
+  while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
+}
+
+module_caddy_roots() {
+  local _files=""
+  [ -f /etc/caddy/Caddyfile ] && _files="/etc/caddy/Caddyfile"
+  for f in /etc/caddy/Caddyfile.d/*.caddy /etc/caddy/*.caddy; do
+    [ -f "$f" ] && _files="$_files $f"
+  done
+  [ -z "$_files" ] && return
+
+  cat $_files 2>/dev/null | grep -v '^\s*#' | \
+  awk '
+    /^[a-zA-Z0-9]/ && /\./ && !/import|tls|encode|root|reverse_proxy|handle|log|php/ {
+      gsub(/\{.*/,""); gsub(/,/," "); gsub(/https?:\/\//,"");
+      n=split($0,a," ");
+      for(i=1;i<=n;i++) {
+        gsub(/:[0-9]+$/,"",a[i]);
+        if(a[i] ~ /[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}/) dom=a[i]
+      }
+    }
+    /reverse_proxy/ { gsub(/[;]/,"",$2); if(dom) printf "  \033[0;36m→\033[0m %-40s \033[2m→ proxy: %s\033[0m\n",dom,$2; dom="" }
+    /root \*/ { gsub(/[;]/,"",$3); if(dom) printf "  \033[0;36m→\033[0m %-40s \033[2m%s\033[0m\n",dom,$3; dom="" }
+    /^\}/ { dom="" }
+  '
+}
+
+# ============================================================
+# MODULE: RunCloud
+# ============================================================
+module_runcloud() {
+  local _raw _d
+
+  # RunCloud simpan nginx config di /etc/nginx-rc/apps.d/ atau conf.d
+  for DIR in /etc/nginx-rc/apps.d /etc/nginx-rc/conf.d \
+             /etc/nginx/conf.d /etc/nginx/sites-enabled \
+             /etc/apache2-rc/sites-enabled /etc/apache2/sites-enabled; do
+    [ -d "$DIR" ] || continue
+    _raw=$(grep -Rh 'server_name\|ServerName' "$DIR" 2>/dev/null \
+      | grep -v '^\s*#' | grep -v 'if\s*(' \
+      | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
+      | grep -Ev 'example|localhost|invalid|\.local$')
+    [ -n "$_raw" ] && while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
+  done
+
+  # Fallback: cari server_name di seluruh config nginx-rc
+  if [ ${#DOMAINS[@]} -eq 0 ]; then
+    _raw=$(find /etc/nginx-rc /etc/nginx /etc/apache2-rc /etc/apache2 \
+           -name "*.conf" 2>/dev/null \
+      | xargs grep -h 'server_name\|ServerName' 2>/dev/null \
+      | grep -v '^\s*#' | grep -v 'if\s*(' \
+      | grep -oE '[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}' \
+      | grep -Ev 'example|localhost|invalid|\.local$')
+    [ -n "$_raw" ] && while IFS= read -r _d; do [[ -n "$_d" ]] && DOMAINS+=("$_d"); done <<< "$_raw"
+  fi
+}
+
+module_runcloud_roots() {
+  for DIR in /etc/nginx-rc/apps.d /etc/nginx-rc/conf.d \
+             /etc/nginx/conf.d /etc/nginx/sites-enabled; do
+    [ -d "$DIR" ] || continue
+    grep -Rh 'server_name\|^\s*root\s\|proxy_pass' "$DIR" 2>/dev/null \
+      | grep -v '^\s*#' | grep -v 'if\s*(' | \
+    awk '
+      /server_name/ { match($0,/[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}/); dom=substr($0,RSTART,RLENGTH) }
+      /^\s*root\s/  { gsub(/[;]/,"",$2); if(dom){ printf "  \033[0;36m→\033[0m %-40s \033[2m%s\033[0m\n",dom,$2; dom="" } }
+      /proxy_pass/  { gsub(/[;]/,"",$2); if(dom){ printf "  \033[0;36m→\033[0m %-40s \033[2m→ proxy: %s\033[0m\n",dom,$2; dom="" } }
+    '
+  done
+
+  # Apache RC roots
+  for DIR in /etc/apache2-rc/sites-enabled /etc/apache2/sites-enabled; do
+    [ -d "$DIR" ] || continue
+    grep -Rh 'ServerName\|DocumentRoot' "$DIR" 2>/dev/null | grep -v '^\s*#' | \
+    awk '
+      /[Ss]erver[Nn]ame/ { match($0,/[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}/); dom=substr($0,RSTART,RLENGTH) }
+      /[Dd]ocument[Rr]oot/ { gsub(/[";]/,"",$2); if(dom) printf "  \033[0;36m→\033[0m %-40s \033[2m%s\033[0m\n",dom,$2; dom="" }
+    '
+  done
+}
+
+# ============================================================
+# COLLECT DOMAINS berdasarkan engine
+# ============================================================
+collect_domains() {
+  case "$WEB_ENGINE" in
+    nginx)         module_nginx ;;
+    apache)        module_apache ;;
+    nginx+apache)  module_nginx; module_apache ;;
+    cpanel)        module_cpanel ;;
+    ispconfig)     module_ispconfig ;;
+    directadmin)   module_directadmin ;;
+    plesk)         module_plesk ;;
+    openlitespeed) module_openlitespeed ;;
+    caddy)         module_caddy ;;
+    runcloud)      module_runcloud ;;
+    unknown)       module_nginx; module_apache ;; # fallback scan dua engine utama
+  esac
+  DOMAINS=($(printf '%s\n' "${DOMAINS[@]}" | sort -u))
+}
+
+# ============================================================
+# SHOW WEB ROOTS berdasarkan engine
+# ============================================================
+show_webroots() {
+  header "WEB ROOT LOCATIONS"
+  case "$WEB_ENGINE" in
+    nginx)         module_nginx_roots ;;
+    apache)        module_apache_roots ;;
+    nginx+apache)  module_nginx_roots; module_apache_roots ;;
+    cpanel)        module_cpanel_roots ;;
+    ispconfig)     module_nginx_roots; module_apache_roots ;;
+    directadmin)   module_directadmin_roots ;;
+    plesk)         module_plesk_roots ;;
+    openlitespeed) module_openlitespeed_roots ;;
+    caddy)         module_caddy_roots ;;
+    runcloud)      module_runcloud_roots ;;
+    unknown)       module_nginx_roots; module_apache_roots ;;
+  esac
+}
+
+# ============================================================
+# DOMAIN CMS FINGERPRINT (passive homepage check)
+# ============================================================
+detect_cms() {
+  local _domain="$1" _tmp_body _tmp_headers _code _cms _combined
+  _tmp_body=$(mktemp 2>/dev/null) || { echo "Unknown"; return; }
+  _tmp_headers=$(mktemp 2>/dev/null) || { rm -f "$_tmp_body"; echo "Unknown"; return; }
+
+  _code=$(curl -k -L -sS --connect-timeout 4 --max-time 8 \
+    -A "ServerCheck-CMS-Fingerprint/2.4" \
+    -D "$_tmp_headers" -o "$_tmp_body" -w '%{http_code}' \
+    "https://${_domain}/" 2>/dev/null)
+
+  if [ -z "$_code" ] || [ "$_code" = "000" ]; then
+    : > "$_tmp_headers"
+    _code=$(curl -L -sS --connect-timeout 4 --max-time 8 \
+      -A "ServerCheck-CMS-Fingerprint/2.4" \
+      -D "$_tmp_headers" -o "$_tmp_body" -w '%{http_code}' \
+      "http://${_domain}/" 2>/dev/null)
+  fi
+
+  _combined="${_tmp_headers} ${_tmp_body}"
+  _cms="Tidak terdeteksi"
+
+  if grep -Eqi 'wp-content/|wp-includes/|<meta[^>]+generator[^>]+WordPress|wordpress' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
+    _cms="WordPress"
+  elif grep -Eqi 'content="Joomla|com_content|/media/system/js/|Joomla!' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
+    _cms="Joomla"
+  elif grep -Eqi 'Drupal.settings|/sites/default/files/|content="Drupal|X-Generator: Drupal' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
+    _cms="Drupal"
+  elif grep -Eqi 'Magento|mage-cache|/static/version[0-9]+/' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
+    _cms="Magento"
+  elif grep -Eqi 'cdn.shopify.com|Shopify.theme|shopify-section' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
+    _cms="Shopify"
+  elif grep -Eqi 'PrestaShop|prestashop' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
+    _cms="PrestaShop"
+  elif grep -Eqi 'catalog/view/theme|OpenCart' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
+    _cms="OpenCart"
+  elif grep -Eqi 'ghost-url|content="Ghost|/ghost/api/' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
+    _cms="Ghost"
+  elif grep -Eqi 'Moodle|/theme/yui_combo.php' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
+    _cms="Moodle"
+  elif grep -Eqi 'TYPO3|typo3temp|/typo3/' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
+    _cms="TYPO3"
+  elif grep -Eqi 'content="Wix|wixstatic.com|X-Wix-' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
+    _cms="Wix"
+  elif grep -Eqi 'squarespace.com|static1.squarespace.com' "$_tmp_body" "$_tmp_headers" 2>/dev/null; then
+    _cms="Squarespace"
+  fi
+
+  rm -f "$_tmp_body" "$_tmp_headers"
+  printf '%s' "$_cms"
+}
+
+# ============================================================
+# 1. SYSTEM INFO
+# ============================================================
+header "SYSTEM INFO"
+HOSTNAME=$(hostname 2>/dev/null)
+OS=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2)
+KERNEL=$(uname -r)
+UPTIME=$(uptime -p 2>/dev/null || uptime)
+MYIP=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+LOCALIP=$(hostname -I | awk '{print $1}')
+
+echo -e "  ${INFO} Hostname   : ${W}${HOSTNAME}${NC}"
+echo -e "  ${INFO} OS         : ${OS}"
+echo -e "  ${INFO} Kernel     : ${KERNEL}"
+echo -e "  ${INFO} Uptime     : ${UPTIME}"
+echo -e "  ${INFO} Public IP  : ${W}${MYIP}${NC}"
+echo -e "  ${INFO} Local IP   : ${LOCALIP}"
+
+# ============================================================
+# 2. DETECT ENGINE
+# ============================================================
+detect_engine
+
+# ============================================================
+# 3. DOMAIN DETECTION
+# ============================================================
+header "DOMAIN DETECTION"
+collect_domains
+
+echo -e "  ${INFO} Ditemukan ${W}${#DOMAINS[@]}${NC} domain\n"
+
+if [ ${#DOMAINS[@]} -eq 0 ]; then
+  echo -e "  ${WARN} Tidak ada domain terdeteksi"
+else
+  printf "  %-36s %-14s %-6s %-6s %-8s %s\n" "DOMAIN" "DNS" "HTTP" "SSL" "EXPIRE" "CMS"
+  divider
+
+  for DOMAIN in "${DOMAINS[@]}"; do
+    # DNS
+    RESOLVED=$(getent hosts "$DOMAIN" 2>/dev/null | awk '{print $1}' | head -1)
+    [ -z "$RESOLVED" ] && RESOLVED=$(nslookup "$DOMAIN" 2>/dev/null | grep 'Address:' | tail -1 | awk '{print $2}')
+    if [ -z "$RESOLVED" ]; then
+      DNS_STATUS="${R}NXDOMAIN${NC}"
+    elif [ "$RESOLVED" = "$MYIP" ] || [ "$RESOLVED" = "$LOCALIP" ]; then
+      DNS_STATUS="${G}server ini${NC}"
+    else
+      DNS_STATUS="${Y}${RESOLVED}${NC}"
+    fi
+
+    # HTTP
+    HTTP_CODE=$(curl -sk --max-time 4 -o /dev/null -w '%{http_code}' "https://${DOMAIN}" 2>/dev/null)
+    [ -z "$HTTP_CODE" ] && HTTP_CODE=$(curl -sk --max-time 4 -o /dev/null -w '%{http_code}' "http://${DOMAIN}" 2>/dev/null)
+    case "$HTTP_CODE" in
+      2*) HTTP_STATUS="${G}${HTTP_CODE}${NC}" ;;
+      3*) HTTP_STATUS="${C}${HTTP_CODE}${NC}" ;;
+      4*|5*) HTTP_STATUS="${R}${HTTP_CODE}${NC}" ;;
+      *) HTTP_STATUS="${DIM}---${NC}" ;;
+    esac
+
+    # SSL
+    SSL_STATUS="${DIM}N/A${NC}"; SSL_EXPIRE=""
+    if command -v openssl &>/dev/null; then
+      SSL_INFO=$(echo | timeout 3 openssl s_client -servername "$DOMAIN" \
+        -connect "${DOMAIN}:443" 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+      if [ -n "$SSL_INFO" ]; then
+        EXPIRE_EPOCH=$(date -d "$SSL_INFO" +%s 2>/dev/null)
+        DAYS_LEFT=$(( (EXPIRE_EPOCH - $(date +%s)) / 86400 ))
+        if   [ "$DAYS_LEFT" -lt 7  ]; then SSL_STATUS="${R}KRITIS${NC}"; SSL_EXPIRE="${R}${DAYS_LEFT}d${NC}"
+        elif [ "$DAYS_LEFT" -lt 30 ]; then SSL_STATUS="${Y}OK${NC}";     SSL_EXPIRE="${Y}${DAYS_LEFT}d${NC}"
+        else                               SSL_STATUS="${G}OK${NC}";     SSL_EXPIRE="${G}${DAYS_LEFT}d${NC}"
+        fi
+      fi
+    fi
+
+    # CMS fingerprint dari homepage publik (GET terbatas, tanpa crawling).
+    CMS=$(detect_cms "$DOMAIN")
+    printf "  %-36s %-14b %-6b %-6b %-8b %s\n" "$DOMAIN" "$DNS_STATUS" "$HTTP_STATUS" "$SSL_STATUS" "$SSL_EXPIRE" "$CMS"
+  done
 fi
 
-for _cmd in awk sed grep date wc tr cut; do
-    if ! have "$_cmd"; then
-        log "ERROR: command wajib tidak ditemukan: $_cmd"
-        exit 1
-    fi
+# ============================================================
+# 4. WEB ROOT LOCATIONS
+# ============================================================
+show_webroots
+
+# ============================================================
+# 5. RUNNING SERVICES
+# ============================================================
+header "RUNNING SERVICES"
+SERVICES=(nginx apache2 httpd lsws caddy mysql mariadb postgresql php-fpm \
+  php8.3-fpm php8.2-fpm php8.1-fpm php7.4-fpm fail2ban redis-server memcached)
+
+for SVC in "${SERVICES[@]}"; do
+  if systemctl list-units --type=service --all 2>/dev/null | grep -q "${SVC}"; then
+    STATUS=$(systemctl is-active "$SVC" 2>/dev/null)
+    case "$STATUS" in
+      active)   echo -e "  ${PASS} ${SVC}" ;;
+      inactive) echo -e "  ${WARN} ${SVC} (inactive)" ;;
+      failed)   echo -e "  ${FAIL} ${SVC} (FAILED)" ;;
+    esac
+  fi
 done
 
-TMP="${TMPDIR:-/tmp}/domain-recon.$$"
-mkdir -p "$TMP" "$OUTDIR" || exit 1
-cleanup() { rm -rf "$TMP"; }
-trap cleanup EXIT HUP INT TERM
-
-fetch_file() {
-    _url="$1"
-    _dest="$2"
-    _limit="${3:-$TIMEOUT}"
-
-    if have curl; then
-        curl -k -fLsS --connect-timeout "$CONNECT_TIMEOUT" --max-time "$_limit" \
-            -A "$USER_AGENT" -H 'Cache-Control: no-cache' \
-            -o "$_dest" "$_url" 2>/dev/null
-    else
-        wget -q -T "$_limit" -U "$USER_AGENT" -O "$_dest" "$_url" 2>/dev/null
-    fi
-}
-
-# Inventory priority:
-# 1) File passed as argument
-# 2) /root/domain.txt
-# 3) /root/domains.txt
-# 4) ./domain.txt
-# 5) ./domains.txt
-# 6) Download domains.txt from GitHub
-#
-# Never read stdin: when invoked with "curl | bash", stdin contains this script.
-INPUT_FILE="${1:-}"
-SOURCE_FILE=""
-
-if [ -n "$INPUT_FILE" ]; then
-    if [ ! -f "$INPUT_FILE" ] || [ ! -r "$INPUT_FILE" ]; then
-        log "ERROR: file inventory tidak dapat dibaca: $INPUT_FILE"
-        exit 1
-    fi
-    SOURCE_FILE="$INPUT_FILE"
-elif [ -f "/root/domain.txt" ] && [ -r "/root/domain.txt" ]; then
-    SOURCE_FILE="/root/domain.txt"
-elif [ -f "/root/domains.txt" ] && [ -r "/root/domains.txt" ]; then
-    SOURCE_FILE="/root/domains.txt"
-elif [ -f "./domain.txt" ] && [ -r "./domain.txt" ]; then
-    SOURCE_FILE="./domain.txt"
-elif [ -f "./domains.txt" ] && [ -r "./domains.txt" ]; then
-    SOURCE_FILE="./domains.txt"
+# ============================================================
+# 6. PHP
+# ============================================================
+header "PHP"
+PHP_BINS=$(update-alternatives --list php 2>/dev/null || \
+  find /usr/bin /usr/local/bin -name 'php*' -executable 2>/dev/null | grep -E 'php[0-9.]?$' | sort)
+if [ -z "$PHP_BINS" ]; then
+  echo -e "  ${FAIL} PHP tidak terinstall"
 else
-    log "File domain lokal tidak ditemukan. Mengambil inventory dari GitHub:"
-    log "$DOMAINS_URL"
-    if ! fetch_file "$DOMAINS_URL" "$TMP/domains.txt" 20; then
-        log "ERROR: gagal mengambil domains.txt dari GitHub."
-        log "Letakkan domain.txt/domains.txt di /root atau direktori kerja."
-        exit 1
-    fi
-    SOURCE_FILE="$TMP/domains.txt"
+  echo "$PHP_BINS" | while read -r phpbin; do
+    VER=$("$phpbin" -v 2>/dev/null | head -1 | awk '{print $2}')
+    echo -e "  ${PASS} $phpbin — v${VER}"
+  done
+fi
+SOCKS=$(ls /run/php/*.sock 2>/dev/null)
+if [ -n "$SOCKS" ]; then
+  echo -e "  ${INFO} FPM sockets:"
+  echo "$SOCKS" | while read -r s; do echo -e "    ${DIM}${s}${NC}"; done
 fi
 
-cp "$SOURCE_FILE" "$TMP/domains-source.txt" || exit 1
-if [ ! -s "$TMP/domains-source.txt" ]; then
-    log "ERROR: file inventory kosong: $SOURCE_FILE"
-    exit 1
-fi
-log "Inventory digunakan: $SOURCE_FILE"
-
-# Normalize domains; accept bare hostnames or URLs. Strip comments, paths and ports.
-awk '
-{
-    sub(/\r$/, "")
-    sub(/[ \t]*#.*/, "")
-    gsub(/^[ \t]+|[ \t]+$/, "")
-    if ($0 == "") next
-    sub(/^https?:\/\//, "")
-    sub(/\/.*$/, "")
-    sub(/:[0-9]+$/, "")
-    $0=tolower($0)
-    if ($0 ~ /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/ &&
-        $0 !~ /\.\./ && length($0) <= 253) print
-}' "$TMP/domains-source.txt" | awk '!seen[$0]++' > "$TMP/targets.txt"
-
-TOTAL=$(wc -l < "$TMP/targets.txt" | tr -d ' ')
-if [ "$TOTAL" -eq 0 ]; then
-    log "ERROR: tidak ada domain valid di $SOURCE_FILE."
-    log "Pastikan formatnya satu domain per baris, contoh: example.com"
-    exit 1
-fi
-if [ "$TOTAL" -gt "$MAX_DOMAINS" ]; then
-    log "ERROR: jumlah domain $TOTAL melewati batas MAX_DOMAINS=$MAX_DOMAINS."
-    log "Jika memang diperlukan, jalankan: MAX_DOMAINS=1000 bash domainchek.sh"
-    exit 1
+# ============================================================
+# 7. DATABASE
+# ============================================================
+header "DATABASE"
+if command -v mysql &>/dev/null; then
+  if mysql -e "SELECT 1" &>/dev/null 2>&1; then
+    DB_SIZE=$(mysql -e "SELECT ROUND(SUM(data_length+index_length)/1024/1024,1) FROM information_schema.tables;" 2>/dev/null | tail -1)
+    DB_COUNT=$(mysql -e "SHOW DATABASES;" 2>/dev/null | grep -v Database | wc -l)
+    echo -e "  ${PASS} MySQL/MariaDB — ${DB_COUNT} databases, ${DB_SIZE}MB total"
+  else
+    echo -e "  ${WARN} MySQL/MariaDB — tidak bisa connect (butuh password)"
+  fi
+else
+  echo -e "  ${DIM}MySQL tidak terinstall${NC}"
 fi
 
-CSV="$OUTDIR/results.csv"
-JSON="$OUTDIR/results.json"
-HTML="$OUTDIR/index.html"
-
-printf '%s\n' 'domain,status,final_url,http_server,technologies,tls_expiry,dns_ip,title' > "$CSV"
-printf '[\n' > "$JSON"
-
-COUNT=0
-REACHABLE=0
-FAILED=0
-
-while IFS= read -r DOMAIN || [ -n "$DOMAIN" ]; do
-    [ -z "$DOMAIN" ] && continue
-    COUNT=$((COUNT + 1))
-    log "[$COUNT/$TOTAL] Checking $DOMAIN"
-
-    HEADERS="$TMP/headers"
-    BODY="$TMP/body"
-    META="$TMP/meta"
-    : > "$HEADERS"
-    : > "$BODY"
-    : > "$META"
-
-    STATUS="000"
-    FINAL_URL=""
-    SERVER=""
-    TITLE=""
-    TLS_EXPIRY=""
-    DNS_IP=""
-    TECH=""
-
-    if have getent; then
-        DNS_IP=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk 'NR==1 {print $1}')
-    elif have host; then
-        DNS_IP=$(host "$DOMAIN" 2>/dev/null | awk '/has address/ {print $4; exit}')
-    elif have nslookup; then
-        DNS_IP=$(nslookup "$DOMAIN" 2>/dev/null | awk '/^Address: / {ip=$2} END {print ip}')
-    fi
-
-    if have curl; then
-        STATUS=$(curl -k -L -sS --connect-timeout "$CONNECT_TIMEOUT" --max-time "$TIMEOUT" \
-            -A "$USER_AGENT" -D "$HEADERS" -o "$BODY" -w '%{http_code}' \
-            "https://${DOMAIN}/" 2>/dev/null) || STATUS="000"
-
-        FINAL_URL=$(curl -k -L -sS --connect-timeout "$CONNECT_TIMEOUT" --max-time "$TIMEOUT" \
-            -A "$USER_AGENT" -o /dev/null -w '%{url_effective}' \
-            "https://${DOMAIN}/" 2>/dev/null)
-
-        if [ "$STATUS" = "000" ] || [ -z "$STATUS" ]; then
-            STATUS=$(curl -L -sS --connect-timeout "$CONNECT_TIMEOUT" --max-time "$TIMEOUT" \
-                -A "$USER_AGENT" -D "$HEADERS" -o "$BODY" -w '%{http_code}' \
-                "http://${DOMAIN}/" 2>/dev/null) || STATUS="000"
-
-            FINAL_URL=$(curl -L -sS --connect-timeout "$CONNECT_TIMEOUT" --max-time "$TIMEOUT" \
-                -A "$USER_AGENT" -o /dev/null -w '%{url_effective}' \
-                "http://${DOMAIN}/" 2>/dev/null)
-        fi
-    else
-        if fetch_file "https://${DOMAIN}/" "$BODY" "$TIMEOUT"; then
-            STATUS="200"
-            FINAL_URL="https://${DOMAIN}/"
-        elif fetch_file "http://${DOMAIN}/" "$BODY" "$TIMEOUT"; then
-            STATUS="200"
-            FINAL_URL="http://${DOMAIN}/"
-        fi
-    fi
-
-    if [ "$STATUS" != "000" ] && [ -n "$STATUS" ]; then
-        REACHABLE=$((REACHABLE + 1))
-    else
-        FAILED=$((FAILED + 1))
-    fi
-
-    # Case-insensitive header parsing, portable to traditional awk.
-    SERVER=$(awk 'tolower($1)=="server:" {
-        $1=""; sub(/^[ \t]+/, ""); gsub(/\r/, ""); print; exit
-    }' "$HEADERS")
-
-    TITLE=$(tr '\n' ' ' < "$BODY" |
-        sed -n 's/.*<[Tt][Ii][Tt][Ll][Ee][^>]*>\([^<]*\)<\/[Tt][Ii][Tt][Ll][Ee]>.*/\1/p' |
-        cut -c1-180)
-    TITLE=$(printf '%s' "$TITLE" | sed 's/^[ \t]*//; s/[ \t]*$//')
-
-    if have openssl; then
-        if have timeout; then
-            TLS_EXPIRY=$(
-                (echo | timeout 7 openssl s_client -servername "$DOMAIN" \
-                    -connect "${DOMAIN}:443" 2>/dev/null) |
-                openssl x509 -noout -enddate 2>/dev/null |
-                sed 's/^notAfter=//'
-            )
-        else
-            TLS_EXPIRY=$(
-                (echo | openssl s_client -servername "$DOMAIN" \
-                    -connect "${DOMAIN}:443" 2>/dev/null) |
-                openssl x509 -noout -enddate 2>/dev/null |
-                sed 's/^notAfter=//'
-            )
-        fi
-    fi
-
-    cat "$HEADERS" "$BODY" > "$META"
-
-    addtech() {
-        if [ -z "$TECH" ]; then TECH="$1"; else TECH="${TECH}; $1"; fi
-    }
-    sig() { grep -Eqi "$1" "$META"; }
-
-    # CMS
-    if sig 'wp-content|wp-includes|wordpress'; then addtech "WordPress"; fi
-    if sig 'Joomla|com_content|/media/system/js/'; then addtech "Joomla"; fi
-    if sig 'Drupal.settings|/sites/default/files/|content="Drupal'; then addtech "Drupal"; fi
-    if sig 'Magento|mage-cache|/static/version[0-9]+/'; then addtech "Magento"; fi
-    if sig 'Shopify|cdn.shopify.com'; then addtech "Shopify"; fi
-    if sig 'PrestaShop|prestashop'; then addtech "PrestaShop"; fi
-    if sig 'OpenCart|catalog/view/theme'; then addtech "OpenCart"; fi
-    if sig 'Ghost|ghost-url'; then addtech "Ghost"; fi
-    if sig 'Moodle|/theme/yui_combo.php'; then addtech "Moodle"; fi
-
-    # Backend/framework hints
-    if sig 'laravel_session|XSRF-TOKEN'; then addtech "Laravel (indikasi)"; fi
-    if sig 'ci_session|CodeIgniter'; then addtech "CodeIgniter (indikasi)"; fi
-    if sig 'Symfony|sf-toolbar'; then addtech "Symfony"; fi
-    if sig 'next/static|__NEXT_DATA__'; then addtech "Next.js"; fi
-    if sig 'nuxt|_nuxt/'; then addtech "Nuxt"; fi
-    if sig 'Django'; then addtech "Django (indikasi)"; fi
-    if sig 'express'; then addtech "Express.js (indikasi)"; fi
-
-    # Frontend
-    if sig 'react-dom|react.production|__REACT'; then addtech "React"; fi
-    if sig 'vue(\.runtime)?(\.min)?\.js|__VUE__'; then addtech "Vue.js"; fi
-    if sig 'ng-version|angular(\.min)?\.js'; then addtech "Angular"; fi
-    if sig 'jquery(\.min)?\.js|jQuery v'; then addtech "jQuery"; fi
-    if sig 'bootstrap(\.min)?\.(css|js)'; then addtech "Bootstrap"; fi
-    if sig 'tailwindcss|tailwind\.min\.css'; then addtech "Tailwind CSS"; fi
-
-    # Web server and runtime hints
-    case "$SERVER" in
-        *nginx*|*Nginx*) addtech "Nginx" ;;
-        *Apache*|*apache*) addtech "Apache" ;;
-        *LiteSpeed*|*litespeed*) addtech "LiteSpeed" ;;
-        *Microsoft-IIS*|*IIS*) addtech "IIS" ;;
-    esac
-    if sig 'PHPSESSID|X-Powered-By: PHP'; then addtech "PHP (indikasi)"; fi
-    if sig 'X-Powered-By: Express|connect.sid'; then addtech "Node.js/Express (indikasi)"; fi
-    if [ -z "$TECH" ]; then TECH="Tidak terdeteksi"; fi
-
-    # CSV
-    printf '%s,' "$(csv_escape "$DOMAIN")" >> "$CSV"
-    printf '%s,' "$(csv_escape "$STATUS")" >> "$CSV"
-    printf '%s,' "$(csv_escape "$FINAL_URL")" >> "$CSV"
-    printf '%s,' "$(csv_escape "$SERVER")" >> "$CSV"
-    printf '%s,' "$(csv_escape "$TECH")" >> "$CSV"
-    printf '%s,' "$(csv_escape "$TLS_EXPIRY")" >> "$CSV"
-    printf '%s,' "$(csv_escape "$DNS_IP")" >> "$CSV"
-    printf '%s\n' "$(csv_escape "$TITLE")" >> "$CSV"
-
-    # JSON
-    [ "$COUNT" -gt 1 ] && printf ',\n' >> "$JSON"
-    printf '  {"domain":"%s","status":"%s","final_url":"%s","server":"%s","technologies":"%s","tls_expiry":"%s","dns_ip":"%s","title":"%s"}' \
-        "$(json_escape "$DOMAIN")" \
-        "$(json_escape "$STATUS")" \
-        "$(json_escape "$FINAL_URL")" \
-        "$(json_escape "$SERVER")" \
-        "$(json_escape "$TECH")" \
-        "$(json_escape "$TLS_EXPIRY")" \
-        "$(json_escape "$DNS_IP")" \
-        "$(json_escape "$TITLE")" >> "$JSON"
-
-done < "$TMP/targets.txt"
-
-printf '\n]\n' >> "$JSON"
-
-# HTML dashboard: build rows directly from the collected result data.
-cat > "$HTML" <<'HTML_HEAD'
-<!doctype html>
-<html lang="id">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Domain Technology Scanner</title>
-<style>
-body{font:14px system-ui,Arial;margin:0;background:#0b1220;color:#e5e7eb}
-header{padding:24px 4%;background:#111c30}
-h1{margin:0 0 6px;font-size:24px}.muted{color:#9ca3af}
-.wrap{padding:22px 4%}.cards{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px}
-.card{background:#172338;padding:16px 20px;border-radius:10px;min-width:130px}
-.num{font-size:25px;font-weight:700}
-input{padding:10px;border:1px solid #334155;border-radius:7px;background:#111c30;color:white;width:min(420px,90%)}
-table{width:100%;border-collapse:collapse;margin-top:14px;background:#111c30}
-th,td{text-align:left;padding:11px;border-bottom:1px solid #263449;vertical-align:top}
-th{color:#93c5fd}tr:hover{background:#172338}
-.foot{margin-top:20px;color:#9ca3af;font-size:12px}
-</style></head><body>
-<header><h1>Domain Technology Scanner</h1>
-<div class="muted">Passive HTTP/DNS/TLS fingerprinting · Bash edition</div></header>
-<main class="wrap">
-<div class="cards">
-<div class="card"><div class="muted">Total domain</div><div class="num" id="total">0</div></div>
-<div class="card"><div class="muted">HTTP reachable</div><div class="num" id="reachable">0</div></div>
-<div class="card"><div class="muted">Unreachable</div><div class="num" id="failed">0</div></div>
-</div>
-<input id="q" placeholder="Cari domain, teknologi, server..." oninput="filterRows()">
-<div style="overflow:auto"><table>
-<thead><tr><th>Domain</th><th>Status</th><th>Final URL</th><th>Web server</th><th>Teknologi</th><th>DNS IP</th><th>TLS expiry</th><th>Title</th></tr></thead>
-<tbody id="rows">
-HTML_HEAD
-
-# Read CSV fields (generated by this script); values are quoted.
-while IFS=, read -r D S U SRV T TLS IP TITLE; do
-    [ "$D" = '"domain"' ] && continue
-    for V in "$D" "$S" "$U" "$SRV" "$T" "$IP" "$TLS" "$TITLE"; do
-        V=$(printf '%s' "$V" | sed 's/^"//; s/"$//; s/""/"/g')
-        ESCAPED=$(html_escape "$V")
-        case "$V" in
-            "$D") ROW="${ROW-}<td>${ESCAPED}</td>" ;;
-        esac
+if command -v psql &>/dev/null; then
+  if sudo -u postgres psql -c "SELECT 1" &>/dev/null 2>&1; then
+    echo -e "  ${PASS} PostgreSQL — running"
+    sudo -u postgres psql -t -c \
+      "SELECT datname||' ('||pg_size_pretty(pg_database_size(datname))||')' FROM pg_database ORDER BY pg_database_size(datname) DESC;" \
+      2>/dev/null | grep -v '^\s*$' | while read -r line; do
+      echo -e "    ${DIM}${line}${NC}"
     done
-    # Build row explicitly to preserve column order.
-    D=$(printf '%s' "$D" | sed 's/^"//;s/"$//;s/""/"/g')
-    S=$(printf '%s' "$S" | sed 's/^"//;s/"$//;s/""/"/g')
-    U=$(printf '%s' "$U" | sed 's/^"//;s/"$//;s/""/"/g')
-    SRV=$(printf '%s' "$SRV" | sed 's/^"//;s/"$//;s/""/"/g')
-    T=$(printf '%s' "$T" | sed 's/^"//;s/"$//;s/""/"/g')
-    TLS=$(printf '%s' "$TLS" | sed 's/^"//;s/"$//;s/""/"/g')
-    IP=$(printf '%s' "$IP" | sed 's/^"//;s/"$//;s/""/"/g')
-    TITLE=$(printf '%s' "$TITLE" | sed 's/^"//;s/"$//;s/""/"/g')
-    printf '<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n' \
-        "$(html_escape "$D")" "$(html_escape "$S")" "$(html_escape "$U")" \
-        "$(html_escape "$SRV")" "$(html_escape "$T")" "$(html_escape "$IP")" \
-        "$(html_escape "$TLS")" "$(html_escape "$TITLE")" >> "$HTML"
-done < "$CSV"
+  else
+    echo -e "  ${WARN} PostgreSQL — tidak bisa connect"
+  fi
+else
+  echo -e "  ${DIM}PostgreSQL tidak terinstall${NC}"
+fi
 
-cat >> "$HTML" <<'HTML_TAIL'
-</tbody></table></div>
-<div class="foot">Hasil bersifat indikatif berdasarkan respons publik. Teknologi yang tidak mengekspos signature mungkin tidak terdeteksi. Tidak ada exploit atau percobaan login.</div>
-</main>
-<script>
-const rows=[...document.querySelectorAll('#rows tr')];
-document.getElementById('total').textContent=rows.length;
-document.getElementById('reachable').textContent=rows.filter(r=>r.cells[1].textContent!=='000').length;
-document.getElementById('failed').textContent=rows.length-Number(document.getElementById('reachable').textContent);
-function filterRows(){let q=document.getElementById('q').value.toLowerCase();rows.forEach(r=>r.style.display=r.textContent.toLowerCase().includes(q)?'':'none')}
-</script></body></html>
-HTML_TAIL
+# ============================================================
+# 8. SECURITY
+# ============================================================
+header "SECURITY"
+if systemctl is-active fail2ban &>/dev/null; then
+  BANNED=$(fail2ban-client status sshd 2>/dev/null | grep 'Banned IP' | grep -oE '[0-9]+' | tail -1)
+  echo -e "  ${PASS} Fail2ban aktif — ${BANNED:-0} IP banned (SSH)"
+else
+  echo -e "  ${WARN} Fail2ban tidak aktif"
+fi
 
-log ""
-log "Scan selesai."
-log "Inventory       : $SOURCE_FILE"
-log "Total domain    : $TOTAL"
-log "HTTP reachable  : $REACHABLE"
-log "Tidak terjangkau: $FAILED"
-log "Dashboard       : $HTML"
-log "JSON            : $JSON"
-log "CSV             : $CSV"
-log "Catatan: fingerprint bersifat indikatif, berdasarkan informasi yang terlihat dari sisi publik."
+SSH_PORT=$(grep -E '^Port\s' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+PASS_AUTH=$(grep -E '^PasswordAuthentication' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+ROOT_LOGIN=$(grep -E '^PermitRootLogin' /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+echo -e "  ${INFO} SSH port        : ${SSH_PORT:-22}"
+[ "$PASS_AUTH" = "yes" ] \
+  && echo -e "  ${WARN} PasswordAuth    : yes (pertimbangkan disable)" \
+  || echo -e "  ${PASS} PasswordAuth    : ${PASS_AUTH:-default}"
+[ "$ROOT_LOGIN" = "yes" ] \
+  && echo -e "  ${WARN} PermitRootLogin : yes" \
+  || echo -e "  ${PASS} PermitRootLogin : ${ROOT_LOGIN:-default}"
+
+echo -e "\n  ${INFO} Open ports:"
+ss -tlnp 2>/dev/null | grep LISTEN | awk '{print $4}' \
+  | grep -oE '[0-9]+$' | sort -n | uniq | tr '\n' ' '
+echo
+
+# ============================================================
+# 9. BASH USERS & LAST LOGIN
+# ============================================================
+header "BASH USERS & LAST LOGIN"
+printf "  ${W}%-18s %-8s %-12s %s${NC}\n" "USER" "UID" "SHELL" "LAST LOGIN"
+divider
+
+while IFS=: read -r U_NAME _ U_UID _ _ _ U_SHELL; do
+  [[ "$U_SHELL" =~ /(bash|sh|zsh|fish|ksh|tcsh|dash|csh)$ ]] || continue
+  [[ "$U_UID" =~ ^[0-9]+$ ]] || continue
+  { [ "$U_UID" -eq 0 ] || [ "$U_UID" -ge 1000 ]; } || continue
+
+  U_SHELL_SHORT=$(basename "$U_SHELL")
+
+  U_LAST_LINE=$(lastlog -u "$U_NAME" 2>/dev/null | tail -1)
+  if echo "$U_LAST_LINE" | grep -qi "never"; then
+    U_LAST_STR="${DIM}Never${NC}"
+  else
+    U_LAST_RAW=$(last "$U_NAME" 2>/dev/null | grep "^${U_NAME}[[:space:]]" | head -1)
+    if [ -n "$U_LAST_RAW" ]; then
+      U_LAST_DATE=$(echo "$U_LAST_RAW" | awk '{print $4,$5,$6,$7}')
+      U_LAST_STR="${G}${U_LAST_DATE}${NC}"
+    else
+      U_LAST_STR="${DIM}N/A${NC}"
+    fi
+  fi
+
+  printf "  %-18s %-8s %-12s %b\n" "$U_NAME" "$U_UID" "$U_SHELL_SHORT" "$U_LAST_STR"
+done < /etc/passwd
+
+# ============================================================
+# SUMMARY
+# ============================================================
+header "SUMMARY"
+echo -e "  ${INFO} Script    : servercheck.sh v${VERSION} by Rawon Hunter™"
+echo -e "  ${INFO} Engine    : ${W}${WEB_ENGINE}${NC}"
+echo -e "  ${INFO} Domains   : ${#DOMAINS[@]} terdeteksi"
+echo -e "  ${INFO} Disk      : $(df -h / | awk 'NR==2{print $5}') used on /"
+echo
